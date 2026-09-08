@@ -35,7 +35,23 @@ from `docs/tools-spec.md` and `skills/omaframe/` so Wave 2 agents are unblocked.
   SKILL.md §2 wording; demo unaffected). SKILL.md to be amended in Wave 2
   if the skill agent's text and model diverge anywhere else.
 
-## Wave 1 QA result
+## Wave 2 QA result
+
+- `cargo test`: 42 passed, 0 failed (29 lib incl. golden demo, 7 app, 6 CLI).
+- `cargo clippy --all-targets`: clean, zero warnings.
+- Integration fix by manager: `src/bin/omaframe.rs` collided with
+  `src/main.rs` (duplicate bin name). Resolved in Cargo.toml with
+  `autobins = false` + `[[bin]] omaframe` (TUI) + `[[bin]] omaframe-export`
+  (headless CLI). No agent files changed for this.
+- Smoke: `omaframe-export --open testdata/demo.omaframe.json --export txt`
+  is byte-identical to `testdata/demo.txt`; `--export md` wraps correctly.
+- TUI with no TTY now exits with a friendly hint pointing at
+  `omaframe-export` (manager micro-fix in `src/main.rs`).
+- Theme probe: `~/.config/omarchy/current/theme` absent on this machine;
+  falls back to `themes/picotron/colors.toml` as designed.
+- Known gaps deferred to Phase 3: entity-aware select/move with handles,
+  widget stamps (tab reports "Phase 3"), full cellContext line heuristic,
+  live theme reload.
 
 - `cargo test`: 15 passed, 0 failed (incl. golden demo.json→demo.txt byte-identical).
 - `cargo clippy --all-targets`: 3 warnings, all fixed by manager (useless
