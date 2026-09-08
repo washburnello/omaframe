@@ -239,38 +239,73 @@ fn round_away_from_center(v: f64, center: f64) -> i32 {
 /// - Glyph per cell by local slope: `|dy/dx| <= 1` → `─`, else `│`
 ///   (axis extremes fall out; ties go horizontal so 2×2 is all `─`).
 ///   No corners, no snap.
-pub fn draw_ellipse(r: Rect) -> Layer {
-    let mut out = Layer::new();
+/// Outline coordinates for a plain rectangle (the Rect tool): perimeter
+/// cells for a normalized [`Rect`], drawn with the caller's pencil char
+/// instead of a fixed glyph set like [`draw_box`]. Degenerate inputs give
+/// the single cell (1x1), the row (Nx1) or the column (1xN); empty rects
+/// give no cells.
+pub fn rect_cells(r: Rect) -> Vec<(i32, i32)> {
     if r.w == 0 || r.h == 0 {
-        return out;
+        return Vec::new();
+    }
+    let left = r.x as i64;
+    let top = r.y as i64;
+    let right = r.x as i64 + r.w as i64 - 1;
+    let bottom = r.y as i64 + r.h as i64 - 1;
+    let mut pts: HashSet<(i32, i32)> = HashSet::new();
+    if r.w > 1 {
+        for x in left..=right {
+            pts.insert((x as i32, top as i32));
+            if bottom != top {
+                pts.insert((x as i32, bottom as i32));
+            }
+        }
+    } else if r.h == 1 {
+        pts.insert((left as i32, top as i32));
+    }
+    if r.h > 1 {
+        for y in top..=bottom {
+            pts.insert((left as i32, y as i32));
+            if right != left {
+                pts.insert((right as i32, y as i32));
+            }
+        }
+    } else if r.w == 1 {
+        pts.insert((left as i32, top as i32));
+    }
+    let mut out: Vec<(i32, i32)> = pts.into_iter().collect();
+    out.sort();
+    out
+}
+
+/// Ellipse outline coordinates for a normalized [`Rect`]: the symmetric
+/// point set behind [`draw_ellipse`] (column/row solves + dense parametric
+/// sampling + mirror closure), without glyph assignment. Degenerate cases
+/// mirror the box convention: 1×1 → the single cell; 1×N → the column;
+/// N×1 → the row. The Oval tool paints these with the pencil char via
+/// [`paint_cells`]; [`draw_ellipse`] assigns slope-picked `─`/`│`.
+pub fn ellipse_cells(r: Rect) -> Vec<(i32, i32)> {
+    if r.w == 0 || r.h == 0 {
+        return Vec::new();
     }
     let left = r.x;
     let top = r.y;
-    // w/h >= 1 here.
     let right = r.x + r.w as i32 - 1;
     let bottom = r.y + r.h as i32 - 1;
     if r.w == 1 && r.h == 1 {
-        out.set(left, top, Cell::new("─", DRAW_FG, DRAW_BG));
-        return out;
+        return vec![(left, top)];
     }
     if r.w == 1 {
-        for y in top..=bottom {
-            out.set(left, y, Cell::new("│", DRAW_FG, DRAW_BG));
-        }
-        return out;
+        return (top..=bottom).map(|y| (left, y)).collect();
     }
     if r.h == 1 {
-        for x in left..=right {
-            out.set(x, top, Cell::new("─", DRAW_FG, DRAW_BG));
-        }
-        return out;
+        return (left..=right).map(|x| (x, top)).collect();
     }
 
     let cx = (left as f64 + right as f64) / 2.0;
     let cy = (top as f64 + bottom as f64) / 2.0;
     let rx = (right as f64 - left as f64) / 2.0;
     let ry = (bottom as f64 - top as f64) / 2.0;
-    debug_assert!(rx > 0.0 && ry > 0.0);
 
     let mut pts: HashSet<(i32, i32)> = HashSet::new();
 
@@ -317,8 +352,46 @@ pub fn draw_ellipse(r: Rect) -> Layer {
         pts.insert((left + right - x, top + bottom - y));
     }
 
+    let mut out: Vec<(i32, i32)> = pts.into_iter().collect();
+    out.sort();
+    out
+}
+
+pub fn draw_ellipse(r: Rect) -> Layer {
+    let mut out = Layer::new();
+    if r.w == 0 || r.h == 0 {
+        return out;
+    }
+    // w/h >= 1 here.
+    if r.w == 1 && r.h == 1 {
+        out.set(r.x, r.y, Cell::new("─", DRAW_FG, DRAW_BG));
+        return out;
+    }
+    if r.w == 1 {
+        for y in r.y..=r.y + r.h as i32 - 1 {
+            out.set(r.x, y, Cell::new("│", DRAW_FG, DRAW_BG));
+        }
+        return out;
+    }
+    if r.h == 1 {
+        for x in r.x..=r.x + r.w as i32 - 1 {
+            out.set(x, r.y, Cell::new("─", DRAW_FG, DRAW_BG));
+        }
+        return out;
+    }
+
+    let left = r.x;
+    let top = r.y;
+    let right = r.x + r.w as i32 - 1;
+    let bottom = r.y + r.h as i32 - 1;
+    let cx = (left as f64 + right as f64) / 2.0;
+    let cy = (top as f64 + bottom as f64) / 2.0;
+    let rx = (right as f64 - left as f64) / 2.0;
+    let ry = (bottom as f64 - top as f64) / 2.0;
+    debug_assert!(rx > 0.0 && ry > 0.0);
+
     // 5) Slope-picked glyphs (symmetric: depends only on |x-cx|, |y-cy|).
-    for (x, y) in pts {
+    for (x, y) in ellipse_cells(r) {
         let adx = (x as f64 - cx).abs();
         let ady = (y as f64 - cy).abs();
         // |dy/dx| = (ry²·|x-cx|) / (rx²·|y-cy|); INF on the equator.
@@ -804,6 +877,50 @@ mod tests {
         assert_eq!(ch(&bent, 2, 1).as_deref(), Some("│"));
         let bent_v = draw_line(0, 0, 2, 1, false); // bend at (0,1) → └
         assert_eq!(ch(&bent_v, 0, 1).as_deref(), Some("└"));
+    }
+
+    #[test]
+    fn rect_cells_perimeter_and_degenerates() {
+        // 4x3 perimeter: 2*4 + 2*3 - 4 corners double-counted.
+        let r = rect_cells(Rect::new(0, 0, 4, 3));
+        assert_eq!(r.len(), 10);
+        assert!(r.contains(&(0, 0)) && r.contains(&(3, 0)));
+        assert!(r.contains(&(0, 2)) && r.contains(&(3, 2)));
+        // Interior stays empty.
+        assert!(!r.contains(&(1, 1)) && !r.contains(&(2, 1)));
+        // Degenerates mirror the box convention.
+        assert_eq!(rect_cells(Rect::new(5, 5, 1, 1)), vec![(5, 5)]);
+        assert_eq!(
+            rect_cells(Rect::new(0, 0, 1, 3)),
+            vec![(0, 0), (0, 1), (0, 2)]
+        );
+        assert_eq!(
+            rect_cells(Rect::new(0, 0, 3, 1)),
+            vec![(0, 0), (1, 0), (2, 0)]
+        );
+        assert!(rect_cells(Rect::new(0, 0, 0, 5)).is_empty());
+    }
+
+    #[test]
+    fn ellipse_cells_match_draw_ellipse_keys() {
+        // Degenerates.
+        assert_eq!(ellipse_cells(Rect::new(3, 3, 1, 1)), vec![(3, 3)]);
+        assert_eq!(
+            ellipse_cells(Rect::new(0, 0, 1, 3)),
+            vec![(0, 0), (0, 1), (0, 2)]
+        );
+        // Key-set parity with the glyph-assigned builder across sizes.
+        for w in 2..=12u32 {
+            for h in 2..=8u32 {
+                let r = Rect::new(0, 0, w, h);
+                let mut from_cells = ellipse_cells(r);
+                from_cells.sort();
+                let mut from_layer: Vec<(i32, i32)> =
+                    draw_ellipse(r).keys().collect();
+                from_layer.sort();
+                assert_eq!(from_cells, from_layer, "parity w={w} h={h}");
+            }
+        }
     }
 
     #[test]

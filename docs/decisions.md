@@ -35,7 +35,31 @@ from `docs/tools-spec.md` and `skills/omaframe/` so Wave 2 agents are unblocked.
   SKILL.md §2 wording; demo unaffected). SKILL.md to be amended in Wave 2
   if the skill agent's text and model diverge anywhere else.
 
-## Wave 2 QA result
+## Wave 3 QA result (user feedback round)
+
+User reports: (1) rulers confusing → infinite canvas; (2) oval/rect should
+use the palette char; (3) highlighting not working.
+
+- **Rulers removed entirely** (`ui.rs`, `app.rs`, `main.rs`): no
+  `show_rulers`, no `toggle_rulers`, Ctrl+R unbound. The repeating 0–9
+  digits with no tens marker were the confusion; nothing replaces them.
+- **Infinite canvas**: viewport/cursor unclamped (may go negative), no `~`
+  filler rows, wheel pans vertical / Shift+wheel horizontal / middle-drag
+  pans anywhere. `Document.grid` is now the new-file hint + minimum export
+  frame only. Export (`txt`/`md`/`ansi`) expands the frame to content
+  bounds, never shrinks: in-grid files render byte-identically (golden
+  holds). `export_selection` no longer clips to the grid.
+- **Rect tool** (`Tool::Rect`, Alt+D): plain rectangle outline in the active
+  palette char + pots; Box stays the smart auto-junction tool. **Oval now
+  paints `ellipse_cells` with the palette char** (`draw_ellipse` kept for
+  compat/tests). `draw.rs` gained `rect_cells`/`ellipse_cells` (+3 tests,
+  incl. key-parity with `draw_ellipse`).
+- **Highlighting**: the select rubber-band had NO visual (only a status
+  line) — that was the bug. Canvas now tints live-selection cells with the
+  theme highlight bg, glyph preserved. (If the user meant painted-cell
+  colors or cursor instead, those paths verified working.)
+- QA: 46 tests green (incl. new bounds/frame + rect/oval-char tests),
+  clippy clean, golden byte-identical, release rebuilt + menu reinstalled.
 
 - `cargo test`: 42 passed, 0 failed (29 lib incl. golden demo, 7 app, 6 CLI).
 - `cargo clippy --all-targets`: clean, zero warnings.

@@ -1059,19 +1059,15 @@ pub fn save_file(doc: &Document, path: impl AsRef<Path>) -> Result<(), ModelErro
 // ---------------------------------------------------------------------------
 
 fn export_rows(doc: &Document, x0: i32, y0: i32, w: u32, h: u32) -> Vec<String> {
-    let gw = doc.grid.0.min(i32::MAX as u32) as i64;
-    let gh = doc.grid.1.min(i32::MAX as u32) as i64;
-    let x1 = (x0 as i64 + w as i64).min(gw);
-    let y1 = (y0 as i64 + h as i64).min(gh);
-    let x0c = x0.max(0);
-    let y0c = y0.max(0);
+    // Unbounded: the canvas is infinite, `compose`/`cell` return `None`
+    // outside content (rendered/exported as spaces). i64 math keeps extreme
+    // coords panic-free.
+    let x_end = (x0 as i64 + w as i64).min(i32::MAX as i64);
+    let y_end = (y0 as i64 + h as i64).min(i32::MAX as i64);
     let mut lines = Vec::new();
-    if x0c as i64 >= x1 || y0c as i64 >= y1 {
-        return lines;
-    }
-    for y in y0c..y1 as i32 {
+    for y in y0..y_end as i32 {
         let mut line = String::new();
-        for x in x0c..x1 as i32 {
+        for x in x0..x_end as i32 {
             // Continuation guards emit nothing: the wide anchor already
             // occupies both terminal columns.
             if doc.is_continuation(x, y) {
@@ -1102,17 +1098,75 @@ fn join_lines(lines: Vec<String>) -> String {
     }
 }
 
+/// Bounding box of non-transparent cells in visible layers, if any.
+///
+/// The canvas is infinite; [`Document::grid`] is only the new-file hint and
+/// the minimum export frame — never a boundary. Export expands the frame to
+/// fit content but never shrinks it, so files whose content sits inside the
+/// grid render byte-identically to before.
+pub fn content_bounds(doc: &Document) -> Option<Rect> {
+    let mut min_x = i32::MAX;
+    let mut min_y = i32::MAX;
+    let mut max_x = i32::MIN;
+    let mut max_y = i32::MIN;
+    for nl in &doc.layers {
+        if !nl.visible {
+            continue;
+        }
+        for ((x, y), c) in nl.layer.entries() {
+            if c.is_transparent() {
+                continue;
+            }
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+    }
+    if min_x == i32::MAX {
+        return None;
+    }
+    // i64 math keeps pathological coords panic-free; Rect is u32-sized.
+    let w = (max_x as i64 - min_x as i64 + 1).clamp(1, u32::MAX as i64) as u32;
+    let h = (max_y as i64 - min_y as i64 + 1).clamp(1, u32::MAX as i64) as u32;
+    Some(Rect::new(min_x, min_y, w, h))
+}
+
+/// Export frame: grid minimum expanded to fit content (infinite canvas).
+/// `(x0, y0, w, h)` with `w/h >= 1` whenever the grid is non-empty.
+fn export_frame(doc: &Document) -> (i32, i32, u32, u32) {
+    let gw = doc.grid.0.min(i32::MAX as u32) as i64;
+    let gh = doc.grid.1.min(i32::MAX as u32) as i64;
+    let (mut x0, mut y0) = (0i64, 0i64);
+    let (mut x1, mut y1) = (gw, gh);
+    if let Some(b) = content_bounds(doc) {
+        x0 = x0.min(b.x as i64);
+        y0 = y0.min(b.y as i64);
+        x1 = x1.max(b.x as i64 + b.w as i64);
+        y1 = y1.max(b.y as i64 + b.h as i64);
+    }
+    let w = (x1 - x0).clamp(0, u32::MAX as i64) as u32;
+    let h = (y1 - y0).clamp(0, u32::MAX as i64) as u32;
+    (
+        x0.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+        y0.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+        w,
+        h,
+    )
+}
+
 /// Plain-text export (`.txt`): characters only, ANSI stripped. Per row:
 /// `compose` chars (`None` → `' '`), trailing spaces trimmed, fully-empty
 /// trailing rows skipped. Pure of all TUI state, so snapshot tests never
 /// boot Ratatui.
 pub fn export_txt(doc: &Document) -> String {
-    join_lines(export_rows(doc, 0, 0, doc.grid.0, doc.grid.1))
+    let (x0, y0, w, h) = export_frame(doc);
+    join_lines(export_rows(doc, x0, y0, w, h))
 }
 
-/// Plain-text export of a selection rect, clipped to the grid (same row
-/// rules as [`export_txt`]). Used by copy-selection and the CLI
-/// `--selection x,y,w,h` flag.
+/// Plain-text export of a selection rect (unbounded: the infinite canvas has
+/// no grid to clip against; same row rules as [`export_txt`]). Used by
+/// copy-selection and the CLI `--selection x,y,w,h` flag.
 pub fn export_selection(doc: &Document, rect: &Rect) -> String {
     join_lines(export_rows(doc, rect.x, rect.y, rect.w, rect.h))
 }
@@ -1150,14 +1204,15 @@ pub fn export_md(doc: &Document) -> String {
 /// `40–47`/`100–107`; `bg = -1` emits no background code). Lines are reset
 /// with `\x1b[0m` after their last colored cell.
 pub fn export_ansi(doc: &Document) -> String {
-    let gw = doc.grid.0.min(i32::MAX as u32) as i32;
-    let gh = doc.grid.1.min(i32::MAX as u32) as i32;
+    let (fx, fy, fw, fh) = export_frame(doc);
+    let x_end = (fx as i64 + fw as i64).min(i32::MAX as i64);
+    let y_end = (fy as i64 + fh as i64).min(i32::MAX as i64);
     let mut lines = Vec::new();
-    for y in 0..gh {
+    for y in fy..y_end as i32 {
         // (text, color) segments so trailing spaces can be trimmed before
         // any escape is emitted.
         let mut segs: Vec<(String, Option<(i8, i8)>)> = Vec::new();
-        for x in 0..gw {
+        for x in fx..x_end as i32 {
             if doc.is_continuation(x, y) {
                 continue;
             }
@@ -1542,6 +1597,31 @@ mod tests {
         // Fully clipped rects export empty.
         assert_eq!(export_selection(&doc, &Rect::new(100, 100, 5, 5)), "");
         assert_eq!(export_selection(&doc, &Rect::new(0, 0, 0, 5)), "");
+    }
+
+    #[test]
+    fn content_bounds_and_expanded_export_frame() {
+        let mut doc = Document::new("t", 80, 24);
+        assert_eq!(content_bounds(&doc), None);
+        // Content inside the grid: frame is the grid (golden-compatible).
+        doc.active_layer_mut().set(2, 3, Cell::new("x", 7, -1));
+        assert_eq!(
+            content_bounds(&doc),
+            Some(Rect::new(2, 3, 1, 1))
+        );
+        // Content beyond (and before) the grid expands the export frame.
+        doc.active_layer_mut().set(100, 50, Cell::new("y", 7, -1));
+        doc.active_layer_mut().set(-4, -2, Cell::new("z", 7, -1));
+        let b = content_bounds(&doc).expect("bounds");
+        assert_eq!((b.x, b.y), (-4, -2));
+        let txt = export_txt(&doc);
+        let lines: Vec<&str> = txt.lines().collect();
+        assert_eq!(lines.len(), 53, "rows -2..=50");
+        assert!(lines[0].starts_with("z"), "negative-origin row exports");
+        assert!(lines[52].ends_with('y'), "far cell exports past grid");
+        // Hidden layers don't count.
+        doc.layers[0].visible = false;
+        assert_eq!(content_bounds(&doc), None);
     }
 
     #[test]

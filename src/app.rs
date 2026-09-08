@@ -145,13 +145,14 @@ pub fn palette_chars(tab: usize) -> Vec<String> {
 // Tools + App state
 // ---------------------------------------------------------------------------
 
-/// The 9 tools on the left rail (plan §4.1).
+/// The 10 tools on the left rail (plan §4.1).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tool {
     Pencil,
     Box,
     Line,
     RoundedRect,
+    Rect,
     Oval,
     Text,
     Eraser,
@@ -160,11 +161,12 @@ pub enum Tool {
 }
 
 impl Tool {
-    pub const ALL: [Tool; 9] = [
+    pub const ALL: [Tool; 10] = [
         Tool::Pencil,
         Tool::Box,
         Tool::Line,
         Tool::RoundedRect,
+        Tool::Rect,
         Tool::Oval,
         Tool::Text,
         Tool::Eraser,
@@ -178,6 +180,7 @@ impl Tool {
             Tool::Box => "box",
             Tool::Line => "line",
             Tool::RoundedRect => "rrect",
+            Tool::Rect => "rect",
             Tool::Oval => "oval",
             Tool::Text => "text",
             Tool::Eraser => "erase",
@@ -192,6 +195,7 @@ impl Tool {
             Tool::Box => 'b',
             Tool::Line => 'l',
             Tool::RoundedRect => 'r',
+            Tool::Rect => 'd',
             Tool::Oval => 'o',
             Tool::Text => 't',
             Tool::Eraser => 'e',
@@ -206,6 +210,7 @@ impl Tool {
             'b' => Some(Tool::Box),
             'l' => Some(Tool::Line),
             'r' => Some(Tool::RoundedRect),
+            'd' => Some(Tool::Rect),
             'o' => Some(Tool::Oval),
             't' => Some(Tool::Text),
             'e' => Some(Tool::Eraser),
@@ -233,7 +238,6 @@ pub struct App {
     pub viewport: (i32, i32),
     pub palette_tab: usize,
     pub palette_scroll: usize,
-    pub show_rulers: bool,
     pub preview_dark: bool,
     pub status_msg: String,
     pub text_buffer: String,
@@ -244,6 +248,7 @@ pub struct App {
     anchor: Option<(i32, i32)>,
     drawing: bool,
     text_start: Option<(i32, i32)>,
+    pan_anchor: Option<(u16, u16, (i32, i32))>,
 }
 
 impl App {
@@ -264,9 +269,8 @@ impl App {
             viewport: (0, 0),
             palette_tab,
             palette_scroll: 0,
-            show_rulers: true,
             preview_dark,
-            status_msg: "click-drag to draw · right-click grabs · Ctrl-S saves · Ctrl-K commands"
+            status_msg: "click-drag draws · wheel scrolls · middle-drag pans · right-click grabs · Ctrl-S saves"
                 .to_string(),
             text_buffer: String::new(),
             file_path,
@@ -275,6 +279,7 @@ impl App {
             anchor: None,
             drawing: false,
             text_start: None,
+            pan_anchor: None,
         }
     }
 
@@ -297,11 +302,9 @@ impl App {
 
     // --- cursor / viewport ---
 
-    /// Clamp the cursor into the grid and off continuation guards.
+    /// Resolve the cursor off wide-char continuation guards. The canvas is
+    /// infinite: no grid clamping, the cursor roams free.
     pub fn clamp_cursor(&mut self) {
-        let (w, h) = (self.doc.grid.0 as i32, self.doc.grid.1 as i32);
-        self.cursor.0 = self.cursor.0.clamp(0, (w - 1).max(0));
-        self.cursor.1 = self.cursor.1.clamp(0, (h - 1).max(0));
         if self.doc.is_continuation(self.cursor.0, self.cursor.1) && self.cursor.0 > 0 {
             self.cursor.0 -= 1;
         }
@@ -337,9 +340,30 @@ impl App {
         } else if cy >= oy + canvas_h {
             noy = cy - canvas_h + 1;
         }
-        let max_ox = (self.doc.grid.0 as i32 - canvas_w).max(0);
-        let max_oy = (self.doc.grid.1 as i32 - canvas_h).max(0);
-        self.viewport = (nox.clamp(0, max_ox), noy.clamp(0, max_oy));
+        // Infinite canvas: the viewport roams free (may go negative).
+        self.viewport = (nox, noy);
+    }
+
+    // --- middle-drag pan ---
+
+    /// Begin a pan gesture: records the screen cell and viewport origin.
+    pub fn start_pan(&mut self, col: u16, row: u16) {
+        self.pan_anchor = Some((col, row, self.viewport));
+    }
+
+    /// Extend a pan gesture: drags the viewport by the screen delta.
+    pub fn update_pan(&mut self, col: u16, row: u16) {
+        if let Some((c0, r0, (ox, oy))) = self.pan_anchor {
+            self.viewport = (
+                ox - (col as i32 - c0 as i32),
+                oy - (row as i32 - r0 as i32),
+            );
+        }
+    }
+
+    /// Release a pan gesture.
+    pub fn end_pan(&mut self) {
+        self.pan_anchor = None;
     }
 
     // --- palette / pots / chrome toggles ---
@@ -387,10 +411,6 @@ impl App {
         } else {
             "preview: light"
         });
-    }
-
-    pub fn toggle_rulers(&mut self) {
-        self.show_rulers = !self.show_rulers;
     }
 
     pub fn cycle_fg(&mut self) {
@@ -698,8 +718,22 @@ impl App {
                     (x, y)
                 };
                 let r = Rect::from_points(a.0, a.1, c.0, c.1);
-                // Ovals never snap (tools-spec §5).
-                self.scratch = self.tint(draw::draw_ellipse(r));
+                // Ovals never snap (tools-spec §5); the outline uses the
+                // active palette char + pots, like the pencil.
+                self.scratch =
+                    draw::paint_cells(&draw::ellipse_cells(r), &self.ch, self.fg, self.bg);
+            }
+            Tool::Rect => {
+                let c = if shift {
+                    Self::constrain_square_anchor(a, (x, y))
+                } else {
+                    (x, y)
+                };
+                let r = Rect::from_points(a.0, a.1, c.0, c.1);
+                // Plain rectangle outline in the palette char (Box stays the
+                // smart auto-junction tool).
+                self.scratch =
+                    draw::paint_cells(&draw::rect_cells(r), &self.ch, self.fg, self.bg);
             }
             Tool::Select => {
                 let r = Rect::from_points(a.0, a.1, x, y);
@@ -717,7 +751,7 @@ impl App {
         }
         match self.tool {
             Tool::Pencil | Tool::Eraser | Tool::Box | Tool::RoundedRect | Tool::Line
-            | Tool::Oval => {
+            | Tool::Oval | Tool::Rect => {
                 if self.scratch.is_empty() {
                     self.anchor = None;
                     self.drawing = false;
@@ -966,14 +1000,15 @@ mod tests {
     }
 
     #[test]
-    fn cursor_clamps_to_grid_and_off_guards() {
+    fn cursor_roams_free_and_off_guards() {
+        // Infinite canvas: no grid clamping, the cursor keeps any coords.
         let mut app = App::new(test_doc(), None);
         app.cursor = (999, -5);
         app.clamp_cursor();
-        assert_eq!(app.cursor, (79, 0));
+        assert_eq!(app.cursor, (999, -5));
         app.cursor = (-3, 99);
         app.clamp_cursor();
-        assert_eq!(app.cursor, (0, 23));
+        assert_eq!(app.cursor, (-3, 99));
 
         // Wide-char guard resolves to its anchor.
         let mut patch = Layer::new();
@@ -1033,6 +1068,38 @@ mod tests {
         app.commit_text();
         assert!(!app.is_text_session());
         assert!(app.history.undo_len() >= undo_before);
+    }
+
+    #[test]
+    fn rect_and_oval_use_palette_char() {
+        let mut app = App::new(test_doc(), None);
+        app.ch = "#".to_string();
+        app.fg = 2;
+        // Rect: plain outline in the palette char, committed as one entry.
+        app.set_tool(Tool::Rect);
+        app.start_stroke(0, 0, false);
+        app.update_stroke(3, 2, false);
+        app.end_stroke();
+        assert_eq!(app.history.undo_len(), 1);
+        let cell = app.doc.cell(0, 0).expect("rect corner");
+        assert_eq!(cell.ch, "#");
+        assert_eq!(cell.fg, 2);
+        assert!(app.doc.cell(1, 1).is_none(), "rect interior empty");
+        // Oval: same char discipline (no fixed ─/│).
+        app.set_tool(Tool::Oval);
+        app.start_stroke(10, 10, false);
+        app.update_stroke(14, 13, false);
+        app.end_stroke();
+        // Every painted cell (rect + oval) uses the palette char.
+        let mut painted = 0;
+        for ((_, _), c) in app.doc.active_layer().entries() {
+            if c.is_transparent() {
+                continue;
+            }
+            painted += 1;
+            assert_eq!(c.ch, "#", "oval paints the palette char, no fixed ─/│");
+        }
+        assert!(painted > 10, "rect + oval left marks");
     }
 
     #[test]

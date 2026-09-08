@@ -112,10 +112,6 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
                 app.toggle_preview();
                 return true;
             }
-            KeyCode::Char('r') | KeyCode::Char('R') => {
-                app.toggle_rulers();
-                return true;
-            }
             KeyCode::Char('f') | KeyCode::Char('F') => {
                 app.cycle_fg();
                 return true;
@@ -366,26 +362,36 @@ fn handle_mouse(
             }
         }
         MouseEventKind::Down(MouseButton::Middle) => {
-            if let Some(pos) = ui::hit_canvas(areas, app, col, row) {
-                app.grab_at(pos.0, pos.1);
-            }
+            // Middle-drag pans the infinite canvas (anywhere, not just canvas).
+            app.start_pan(col, row);
+        }
+        MouseEventKind::Drag(MouseButton::Middle) => {
+            app.update_pan(col, row);
+        }
+        MouseEventKind::Up(MouseButton::Middle) => {
+            app.end_pan();
         }
         MouseEventKind::ScrollDown => {
             if ui::over_palette_grid(areas, col, row) {
                 app.scroll_palette(1);
             } else if ui::over_canvas(areas, col, row) {
-                app.viewport.1 += 3;
-                let max_oy = (app.doc.grid.1 as i32 - areas.canvas.height as i32).max(0);
-                app.viewport.1 = app.viewport.1.clamp(0, max_oy);
+                // Infinite scroll: wheel pans (Shift+wheel goes horizontal).
+                if shift {
+                    app.viewport.0 += 3;
+                } else {
+                    app.viewport.1 += 3;
+                }
             }
         }
         MouseEventKind::ScrollUp => {
             if ui::over_palette_grid(areas, col, row) {
                 app.scroll_palette(-1);
             } else if ui::over_canvas(areas, col, row) {
-                app.viewport.1 -= 3;
-                let max_oy = (app.doc.grid.1 as i32 - areas.canvas.height as i32).max(0);
-                app.viewport.1 = app.viewport.1.clamp(0, max_oy);
+                if shift {
+                    app.viewport.0 -= 3;
+                } else {
+                    app.viewport.1 -= 3;
+                }
             }
         }
         MouseEventKind::Moved => {
@@ -432,7 +438,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         terminal.draw(|f| ui::render(f, &mut app, &theme))?;
         // Keep the cursor visible after keyboard moves.
         {
-            let areas = ui::compute_layout(term_area(tw, th), app.show_rulers);
+            let areas = ui::compute_layout(term_area(tw, th));
             app.ensure_cursor_visible(areas.canvas.width as i32, areas.canvas.height as i32);
         }
         if app.should_quit {
@@ -444,7 +450,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 handle_key(&mut app, k.code, k.modifiers);
             }
             Event::Mouse(m) => {
-                let areas = ui::compute_layout(term_area(tw, th), app.show_rulers);
+                let areas = ui::compute_layout(term_area(tw, th));
                 handle_mouse(&mut app, &areas, m.kind, m.column, m.row, m.modifiers);
             }
             Event::Resize(w, h) => {

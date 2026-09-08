@@ -13,6 +13,7 @@ use ratatui::{
 };
 
 use crate::app::{App, PALETTE_TABS, Tool, palette_chars};
+use omaframe::model;
 use omaframe::theme;
 
 // ---------------------------------------------------------------------------
@@ -23,7 +24,6 @@ pub const MIN_W: u16 = 60;
 pub const MIN_H: u16 = 12;
 const TOOLS_W: u16 = 11;
 const PALETTE_W: u16 = 24;
-const RULER_LEFT_W: u16 = 5;
 
 /// Screen rects. `tools`, `palette_tabs`, `palette_grid`, `canvas`, `layers`
 /// are interaction rects (titles excluded); the render functions draw titles
@@ -33,8 +33,6 @@ pub struct LayoutAreas {
     pub toolbar: Rect,
     pub tools: Rect,
     pub canvas: Rect,
-    pub ruler_top: Rect,
-    pub ruler_left: Rect,
     pub palette_title: Rect,
     pub palette_tabs: Rect,
     pub palette_pots: Rect,
@@ -49,7 +47,7 @@ fn rows(area: Rect, n: u16) -> Rect {
 }
 
 /// Pure layout: identical rects for rendering and mouse mapping.
-pub fn compute_layout(area: Rect, show_rulers: bool) -> LayoutAreas {
+pub fn compute_layout(area: Rect) -> LayoutAreas {
     if area.width < MIN_W || area.height < MIN_H {
         return LayoutAreas {
             too_small: true,
@@ -80,7 +78,7 @@ pub fn compute_layout(area: Rect, show_rulers: bool) -> LayoutAreas {
     let canvas_outer = h[1];
     let palette_outer = h[2];
 
-    // Tools: 1 title row + 9 tool rows.
+    // Tools: 1 title row + 10 tool rows.
     let tools_tv = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(1)])
@@ -89,27 +87,12 @@ pub fn compute_layout(area: Rect, show_rulers: bool) -> LayoutAreas {
         tools_tv[1].x,
         tools_tv[1].y,
         tools_tv[1].width,
-        tools_tv[1].height.min(9),
+        tools_tv[1].height.min(10),
     );
 
-    // Canvas: optional rulers consume the top row / left columns.
-    let (canvas, ruler_top, ruler_left) = if show_rulers {
-        let vv = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(1)])
-            .split(canvas_outer);
-        let hh = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(RULER_LEFT_W), Constraint::Min(1)])
-            .split(vv[1]);
-        (hh[1], vv[0], hh[0])
-    } else {
-        (
-            canvas_outer,
-            Rect::default(),
-            Rect::default(),
-        )
-    };
+    // Canvas: the whole middle column. The canvas is infinite — no rulers,
+    // no bounds; empty cells render on the preview surface.
+    let canvas = canvas_outer;
 
     // Palette: title + 7 tab rows + 2 pot rows + grid rest.
     let pv = Layout::default()
@@ -126,8 +109,6 @@ pub fn compute_layout(area: Rect, show_rulers: bool) -> LayoutAreas {
         toolbar,
         tools,
         canvas,
-        ruler_top,
-        ruler_left,
         palette_title: pv[0],
         palette_tabs: pv[1],
         palette_pots: pv[2],
@@ -253,7 +234,7 @@ fn chrome_title_style(t: &theme::Theme) -> Style {
 
 fn toolbar_text(app: &App) -> String {
     format!(
-        " File:Ctrl-S Save | Undo:Ctrl-Z Redo:Ctrl-Y | Prev:Ctrl-P Rules:Ctrl-R | Exp:Ctrl-E | Cmd-K | Quit:Ctrl-Q || {} ",
+        " File:Ctrl-S Save | Undo:Ctrl-Z Redo:Ctrl-Y | Prev:Ctrl-P | Exp:Ctrl-E | Cmd-K | Quit:Ctrl-Q || {} ",
         app.file_label()
     )
 }
@@ -305,7 +286,7 @@ fn render_tools(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme)
             style,
         )]));
     }
-    // Box-style + arrow state under the 9 tools when space allows.
+    // Box-state line under the 10 tools when space allows.
     f.render_widget(Paragraph::new(lines), areas.tools);
 }
 
@@ -324,78 +305,43 @@ fn is_guard(doc: &omaframe::model::Document, scratch: &omaframe::model::Layer, x
     false
 }
 
-fn render_rulers(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme) {
-    if !app.show_rulers {
-        return;
-    }
-    let dim = Style::default().fg(t.dim);
-    if areas.ruler_top.width > 0 {
-        let mut spans = Vec::new();
-        for i in 0..areas.ruler_top.width {
-            let doc_x = app.viewport.0 + i as i32;
-            let digit = ((doc_x % 10 + 10) % 10).to_string();
-            spans.push(Span::styled(digit, dim));
-        }
-        f.render_widget(Paragraph::new(Line::from(spans)), areas.ruler_top);
-    }
-    if areas.ruler_left.width > 0 && areas.ruler_left.height > 0 {
-        let mut lines = Vec::new();
-        for i in 0..areas.ruler_left.height {
-            let doc_y = app.viewport.1 + i as i32;
-            lines.push(Line::from(vec![Span::styled(
-                format!("{:>4} ", doc_y),
-                dim,
-            )]));
-        }
-        f.render_widget(Paragraph::new(lines), areas.ruler_left);
-    }
-}
-
 fn render_canvas(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme) {
     let cw = areas.canvas.width as i32;
     let ch = areas.canvas.height as i32;
     if cw <= 0 || ch <= 0 {
         return;
     }
-    let (gw, gh) = (app.doc.grid.0 as i32, app.doc.grid.1 as i32);
     // Empty cells preview on the same surface as transparent-styled cells.
     let empty_style = theme::cell_style(7, -1, t, app.preview_dark);
     let cursor_style = Style::default().bg(t.highlight).fg(t.bg).add_modifier(Modifier::BOLD);
+    let sel = app.history.selection();
     let mut lines: Vec<Line> = Vec::with_capacity(ch as usize);
     for dy in 0..ch {
         let doc_y = app.viewport.1 + dy;
         let mut spans: Vec<Span> = Vec::new();
-        if doc_y < 0 || doc_y >= gh {
-            spans.push(Span::styled("~".repeat(cw.max(0) as usize), Style::default().fg(t.dim)));
-            lines.push(Line::from(spans));
-            continue;
-        }
         for dx in 0..cw {
             let doc_x = app.viewport.0 + dx;
-            if doc_x < 0 || doc_x >= gw {
-                spans.push(Span::styled(" ", empty_style));
-                continue;
-            }
             if is_guard(&app.doc, &app.scratch, doc_x, doc_y) {
                 continue; // wide anchor already occupies both terminal cols
             }
             let on_cursor = (doc_x, doc_y) == app.cursor;
-            match app.doc.compose(&app.scratch, doc_x, doc_y) {
-                Some(c) => {
-                    let mut st = theme::cell_style(c.fg, c.bg, t, app.preview_dark);
-                    if on_cursor {
-                        st = cursor_style;
-                    }
-                    spans.push(Span::styled(c.ch.clone(), st));
-                }
-                None => {
-                    if on_cursor {
-                        spans.push(Span::styled(" ", cursor_style));
-                    } else {
-                        spans.push(Span::styled(" ", empty_style));
-                    }
-                }
+            let in_sel = sel.is_some_and(|r| r.contains(doc_x, doc_y));
+            let composed = app.doc.compose(&app.scratch, doc_x, doc_y);
+            let mut st = match &composed {
+                Some(c) => theme::cell_style(c.fg, c.bg, t, app.preview_dark),
+                None => empty_style,
+            };
+            let glyph = match &composed {
+                Some(c) => c.ch.clone(),
+                None => " ".to_string(),
+            };
+            if on_cursor {
+                st = cursor_style;
+            } else if in_sel {
+                // Selection rubber-band: tint the surface, keep the glyph.
+                st = st.bg(t.highlight);
             }
+            spans.push(Span::styled(glyph, st));
         }
         lines.push(Line::from(spans));
     }
@@ -504,22 +450,24 @@ fn render_layers(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme
 }
 
 fn render_status(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme) {
-    let (w, h) = (app.doc.grid.0, app.doc.grid.1);
+    let size = match model::content_bounds(&app.doc) {
+        Some(b) => format!("{}x{}", b.w, b.h),
+        None => "empty".to_string(),
+    };
     let bg_label = if app.bg < 0 { "-".to_string() } else { app.bg.to_string() };
     let sel = match app.history.selection() {
         Some(r) => format!(" sel {}x{}@{},{}", r.w, r.h, r.x, r.y),
         None => String::new(),
     };
     let msg = format!(
-        "cell {},{} · {} · fg {} bg {} · {} · {}x{}{} · {} [{}] · {}",
+        "cell {},{} · {} · fg {} bg {} · {} · {}{} · [{}] {} · {}",
         app.cursor.0,
         app.cursor.1,
         app.active_layer_name(),
         app.fg,
         bg_label,
         app.file_label(),
-        w,
-        h,
+        size,
         sel,
         app.tool.label(),
         app.ch,
@@ -536,7 +484,7 @@ fn render_status(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme
 /// shows a one-line guard message instead of the full layout.
 pub fn render(f: &mut Frame, app: &mut App, t: &theme::Theme) {
     let area = f.area();
-    let areas = compute_layout(area, app.show_rulers);
+    let areas = compute_layout(area);
     if areas.too_small {
         let msg = format!(
             "terminal too small: need {}x{}, have {}x{} — enlarge to draw",
@@ -547,7 +495,6 @@ pub fn render(f: &mut Frame, app: &mut App, t: &theme::Theme) {
     }
     render_toolbar(f, &areas, app, t);
     render_tools(f, &areas, app, t);
-    render_rulers(f, &areas, app, t);
     render_canvas(f, &areas, app, t);
     render_palette(f, &areas, app, t);
     render_layers(f, &areas, app, t);
