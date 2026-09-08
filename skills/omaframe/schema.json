@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "omaframe wireframe",
+  "description": "Schema for .omaframe.json wireframe files (plan.md sections 3.2 and 4.4, Appendix C). A fixed cell grid with stacked sparse layers, plus optional parametric widgets and a dark/light preview hint.",
+  "type": "object",
+  "required": ["version", "name", "grid", "layers"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "const": 1,
+      "description": "File format version. v1 only."
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Human-readable wireframe name, e.g. \"settings-panel\"."
+    },
+    "grid": {
+      "type": "object",
+      "description": "Fixed cell grid. 1 cell = 1 terminal character cell.",
+      "required": ["w", "h"],
+      "additionalProperties": false,
+      "properties": {
+        "w": {"type": "integer", "minimum": 1, "maximum": 500},
+        "h": {"type": "integer", "minimum": 1, "maximum": 200}
+      }
+    },
+    "layers": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Stacked layers, bottom first. Suggested default: [wireframe, labels].",
+      "items": {
+        "type": "object",
+        "required": ["name", "visible", "cells"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {"type": "string", "minLength": 1},
+          "visible": {"type": "boolean"},
+          "cells": {
+            "type": "array",
+            "description": "Sparse storage: only non-transparent cells are listed.",
+            "items": {
+              "type": "object",
+              "required": ["x", "y", "ch", "fg", "bg"],
+              "additionalProperties": false,
+              "properties": {
+                "x": {"type": "integer", "minimum": 0},
+                "y": {"type": "integer", "minimum": 0},
+                "ch": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 2,
+                  "description": "One character (a base char plus at most one combining mark / variation selector). Null and space are never stored: they are transparent."
+                },
+                "fg": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 15,
+                  "description": "Foreground color: Omarchy ANSI index color0-color15."
+                },
+                "bg": {
+                  "type": "integer",
+                  "minimum": -1,
+                  "maximum": 15,
+                  "description": "Background color: 0-15, or -1 = transparent."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "widgets": {
+      "type": "array",
+      "description": "Optional parametric widget entities (plan.md section 4.4). Resize/relabel source of truth; layers hold the baked cells used for text export.",
+      "items": {
+        "type": "object",
+        "required": ["kind", "x", "y", "w", "h"],
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Widget kind, e.g. button, input, checkbox, progress, panel, tabs."
+          },
+          "x": {"type": "integer", "minimum": 0},
+          "y": {"type": "integer", "minimum": 0},
+          "w": {"type": "integer", "minimum": 1},
+          "h": {"type": "integer", "minimum": 1},
+          "label": {"type": "string"},
+          "style": {
+            "type": "string",
+            "description": "Style variant, e.g. default, rounded, checked, focused."
+          }
+        }
+      }
+    },
+    "preview": {
+      "type": "object",
+      "description": "Preview hint. Flips the canvas background surface only; wireframe fg indices never change.",
+      "additionalProperties": false,
+      "properties": {
+        "dark": {"type": "boolean"}
+      }
+    },
+    "paletteTab": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Last-active Palette tab name, e.g. \"outlines\"."
+    }
+  }
+}

@@ -4,3 +4,8 @@ yarn-error.log
 user.bazelrc
 test-results/
 worktrees/
+
+
+# Added by cargo
+
+/target/

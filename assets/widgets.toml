@@ -1,0 +1,196 @@
+# omaframe widget stamp catalog — v1 seed.
+# See plan.md §4.4 ("Widget stamps") and Appendix A.
+#
+# Each widget is a parametric entity ({kind, w, h, label, style}), not baked
+# chars, so resize/relabel works. Serialized in .omaframe.json as widgets[]
+# with a baked-cells fallback for export.
+#
+# Schema per [[widget]]:
+#   kind       entity name stored in .omaframe.json widgets[]
+#   label      default label text ({label} in templates)
+#   default_w  default width in cells (resize reflows borders, shifts label)
+#   default_h  default height in cells
+#   styles     style variants; template_<style> holds the ASCII rendering
+#   example    concrete rendering at default size, default style
+#
+# Placeholders: {label} label text, {bar} progress fill (reflows with w).
+# Templates are drawn at default_w; horizontal rules (─) and padding reflow
+# when the widget is resized via handles.
+
+# Button: [ OK ], focused [>OK<]. (Appendix A)
+[[widget]]
+kind = "button"
+label = "OK"
+default_w = 8
+default_h = 1
+styles = ["light", "focused", "ascii"]
+template_light = "[ {label} ]"
+template_focused = "[>{label}<]"
+template_ascii = "[ {label} ]"
+example = "[ OK ]"
+
+# Input: [________], typing [ user_ ].
+[[widget]]
+kind = "input"
+label = "user"
+default_w = 12
+default_h = 1
+styles = ["empty", "typing", "ascii"]
+template_empty = "[________]"
+template_typing = "[ {label}_ ]"
+template_ascii = "[________]"
+example = "[ user_ ]"
+
+# Dropdown: [ option ▼ ].
+[[widget]]
+kind = "dropdown"
+label = "option"
+default_w = 14
+default_h = 1
+styles = ["light", "focused", "ascii"]
+template_light = "[ {label} ▼ ]"
+template_focused = "[>{label} ▼<]"
+template_ascii = "[ {label} v ]"
+example = "[ option ▼ ]"
+
+# Radio: (◉) on / (○) off.
+[[widget]]
+kind = "radio"
+label = "on"
+default_w = 8
+default_h = 1
+styles = ["on", "off", "ascii_on", "ascii_off"]
+template_on = "(◉) {label}"
+template_off = "(○) {label}"
+template_ascii_on = "(*) {label}"
+template_ascii_off = "( ) {label}"
+example = "(◉) on"
+
+# Checkbox: [x] yes / [ ] no (already ASCII).
+[[widget]]
+kind = "checkbox"
+label = "yes"
+default_w = 9
+default_h = 1
+styles = ["checked", "unchecked"]
+template_checked = "[x] {label}"
+template_unchecked = "[ ] {label}"
+example = "[x] yes"
+
+# Toggle: [●○] / [○●].
+[[widget]]
+kind = "toggle"
+label = ""
+default_w = 6
+default_h = 1
+styles = ["on", "off", "ascii_on", "ascii_off"]
+template_on = "[●○]"
+template_off = "[○●]"
+template_ascii_on = "[ON]"
+template_ascii_off = "[--]"
+example = "[●○]"
+
+# Close/X: [X], bare X.
+[[widget]]
+kind = "close"
+label = ""
+default_w = 3
+default_h = 1
+styles = ["boxed", "bare"]
+template_boxed = "[X]"
+template_bare = "X"
+example = "[X]"
+
+# Scrollbar: ▲ ▼ █ ░ (vertical default; horizontal variant).
+[[widget]]
+kind = "scrollbar"
+label = ""
+default_w = 1
+default_h = 5
+styles = ["vertical", "horizontal", "ascii_vertical", "ascii_horizontal"]
+template_vertical = """▲
+█
+░
+░
+▼"""
+template_horizontal = "◄ █ ░ ░ ►"
+template_ascii_vertical = """^
+#
+-
+-
+v"""
+template_ascii_horizontal = "< # - - >"
+example = """▲
+█
+░
+░
+▼"""
+
+# Progress: [████░░░░] 60%. {bar} reflows fill/track cells with w.
+[[widget]]
+kind = "progress"
+label = "60%"
+default_w = 14
+default_h = 1
+styles = ["light", "ascii"]
+template_light = "[{bar}] {label}"
+template_ascii = "[{bar}] {label}"
+example = "[████░░░░] 60%"
+
+# Divider: ──── / ════ (full-width horizontal rule).
+[[widget]]
+kind = "divider"
+label = ""
+default_w = 16
+default_h = 1
+styles = ["light", "heavy", "double", "ascii"]
+template_light = "────────────────"
+template_heavy = "━━━━━━━━━━━━━━━━"
+template_double = "════════════════"
+template_ascii = "----------------"
+example = "────────────────"
+
+# Panel/window: rounded rect + title bar + [X]. Body rows (│ │) repeat to h.
+[[widget]]
+kind = "panel"
+label = "Title"
+default_w = 24
+default_h = 5
+styles = ["rounded", "light", "double", "ascii"]
+template_rounded = """╭─ {label} ──────────[X]─╮
+│                      │
+│                      │
+│                      │
+╰──────────────────────╯"""
+template_light = """┌─ {label} ──────────[X]─┐
+│                      │
+│                      │
+│                      │
+└──────────────────────┘"""
+template_double = """╔═ {label} ══════════[X]═╗
+║                      ║
+║                      ║
+║                      ║
+╚══════════════════════╝"""
+template_ascii = """+- {label} ----------[X]-+
+|                      |
+|                      |
+|                      |
++----------------------+"""
+example = """╭─ Title ──────────[X]─╮
+│                      │
+│                      │
+│                      │
+╰──────────────────────╯"""
+
+# Tabs: [ Tab1 | Tab2 ].
+[[widget]]
+kind = "tabs"
+label = "Tab1"
+default_w = 16
+default_h = 1
+styles = ["light", "focused", "ascii"]
+template_light = "[ {label} | Tab2 ]"
+template_focused = "[>{label}<| Tab2 ]"
+template_ascii = "[ {label} | Tab2 ]"
+example = "[ Tab1 | Tab2 ]"

@@ -1,0 +1,208 @@
+# omaframe TUI — Palette Spec
+
+> Data spec for the Palette sidebar (plan §4.2–§4.4). The Palette is a
+> **character + color provider** for the pencil/oval/shape tools and the
+> widget stamper. It stores no canvas state — selection only sets
+> `(activeCh, fgPot, bgPot)` consumed by the tools in `docs/tools-spec.md`.
+
+## 1. Layout (normative order, top → bottom)
+
+1. **Tab row**: `Letters Numbers Symbols Outlines Blocks Nerds Widgets`
+   (default order; user-sortable, §5).
+2. **Pots row**: `fg [i ■]` + `bg [j ■]` swatches showing ANSI-16 index +
+   rendered color. `-` on bg = transparent.
+3. **Character grid**: one big scrolling grid for the active tab. Single
+   column of large cells; mouse click selects; arrow keys move a focus ring;
+   `Enter` confirms (same as click). Nerds tab shows a missing-glyph banner
+   instead of tofu where applicable (§6).
+
+Status bar echoes: `ch '<c>' fg <i> bg <j> tab <name>`.
+
+## 2. Tab contents (exact v1 seed lists)
+
+Order **within** a tab is fixed (not user-sortable) and is part of this spec.
+Implementations must expose the lists in exactly this order so snapshot tests
+and agents can index them.
+
+### 2.1 Letters — 52 entries
+
+```
+A B C D E F G H I J K L M
+N O P Q R S T U V W X Y Z
+a b c d e f g h i j k l m
+n o p q r s t u v w x y z
+```
+
+Ranges `U+0041–U+005A`, `U+0061–U+007A`.
+
+### 2.2 Numbers — 10 entries
+
+```
+0 1 2 3 4 5 6 7 8 9
+```
+
+`U+0030–U+0039`. (Numeric suffixes / fractions deferred — plan §4.3.)
+
+### 2.3 Symbols — 32 entries (full printable ASCII punctuation set)
+
+Canonical ASCII code order (`U+0021–U+002F`, `U+003A–U+0040`,
+`U+005B–U+0060`, `U+007B–U+007E`):
+
+```
+! " # $ % & ' ( ) * + , - . /
+: ; < = > ? @ [ \ ] ^ _ ` { | } ~
+```
+
+That is: `!` `"` `#` `$` `%` `&` `'` `(` `)` `*` `+` `,` `-` `.` `/`
+`:` `;` `<` `=` `>` `?` `@` `[` `\` `]` `^` `_` `` ` `` `{` `|` `}` `~`.
+No letters/digits/space in this tab (they live in Letters/Numbers; space is
+transparency, never a palette entry).
+
+### 2.4 Outlines — 27 entries (exact order)
+
+```
+─ │ ┌ ┐ └ ┘ ├ ┤ ┬ ┴ ┼ ╭ ╮ ╯ ╰ ━ ┃ ═ ║ ╔ ╗ ╱ ╲ ╳ + - |
+```
+
+Grouped: light box set (11) → rounded corners (4) → heavy `━ ┃` (2) →
+double `═ ║ ╔ ╗` (4) → diagonals `╱ ╲ ╳` (3) → ASCII fallback `+ - |` (3).
+
+> Seed list is exactly the task's 27-char list (plan §4.3/Appendix B agree
+> modulo `+ - |`, which are included here). Missing relatives (`┏┓┗┛ ╚╝ ╠╣
+> ╦╩ ╬` and heavy/double junctions) are **deferred** — required before the
+> heavy/double box styles can auto-junction (open Q1 in tools-spec).
+
+### 2.5 Blocks — 21 entries (exact order)
+
+```
+█ ▓ ▒ ░ ▀ ▄ ▌ ▐ ▖ ▗ ▘ ▝ ▚ ▞ ▟ ▁ ▂ ▃ ▅ ▆ ▇
+```
+
+Grouped: full (1) → shades 75/50/25 `▓ ▒ ░` (3) → halves `▀ ▄ ▌ ▐` (4) →
+quadrants `▖ ▗ ▘ ▝` + cross-quadrants `▚ ▞ ▟` (7)
+→ lower eighths `▁ ▂ ▃ ▅ ▆ ▇` (6).
+
+> Exactly the task's 21-char list. Plan §4.3 additionally names
+> `▏ ▎ ▍ ▊ ▋` (left/upper eighths) — **not** in v1; add them (in that order,
+> after `▇`) only when a `blocks-extended` decision is recorded. Note the
+> gap: there is deliberately no `▔`/`▉`/upper-half in v1 (`▀` covers it).
+
+### 2.6 Nerds — curated ~100 (seeded in Phase 0)
+
+- Source of truth: `assets/nerd.txt` (one glyph per line,
+  `U+XXXX <name>` comment format — to be seeded in Phase 0; does not exist
+  yet on this branch).
+- Plan seed examples (must be in the curated 100): pc ``, cpu ``, os ``,
+  terminal ``, folder, file/notepad, git/branch, gear ``, check ``,
+  box ``, warn triangle, music/media, weather.
+- Glyphs are PUA / `unicode-width` 1-or-2 — the model treats them like any
+  char (§7 of model-api); the **font test page** (§6) is the coverage tool.
+- Full 10k-glyph browser explicitly out of scope (plan §4.3).
+
+### 2.7 Widgets — stamps, not chars (plan §4.4)
+
+Each entry is a **parametric entity** `{kind, w, h, label, style}`, placed by
+click-then-drag (rect gesture like Box), resizable via select handles with
+border reflow. v1 catalog (12):
+
+| Kind | Default rendering | Resize rule |
+|---|---|---|
+| button | `[ OK ]` | pad/trim label, keep `[ ]` |
+| button-focused | `[>OK<]` (alt: `⟨ OK ⟩`) | same |
+| input | `[________]` / `[ user_ ]` | repeat `_` |
+| dropdown | `[ option ▼ ]` | pad label, keep `▼ ]` |
+| radio-on / radio-off | `(◉) on` / `(○) off` | label reflows |
+| checkbox-on / checkbox-off | `[x] yes` / `[ ] no` | label reflows |
+| toggle | `[●○]` / `[○●]` | fixed 4-wide, flip state on double-click |
+| close | `[X]` / `X` | fixed |
+| scrollbar-v / scrollbar-h | `▲ █ ░ ▼` column / `◄ █ ░ ►` row | repeat track `█ ░` |
+| progress | `[████░░░░] 60%` | bar width scales, `%` follows |
+| divider | `────` / `════` (tooled style) | repeat run |
+| panel | `╭─ Title ───[X]─╮` + `│` sides + `╰──╯` | borders repeat, title left, `[X]` right-pinned |
+| tabs | `[ Tab1 \| Tab2 ]` | repeat segments, active tab highlighted |
+
+Serialization: `widgets[]` parametric records + **baked cells fallback** for
+export (see `docs/model-api.md` §6). Moving/resizing a widget updates the
+record and re-bakes; hand-editing baked cells does not back-propagate
+(one-way: record → cells).
+
+## 3. fg/bg pot semantics (normative)
+
+Borrowed from Playscii (plan §2.2, §3.4):
+
+- Pots hold ANSI-16 indices: `fg` in `0–15`, `bg` in `0–15` or `-1`
+  (= transparent, shown as `‑`/`∅` swatch with checkerboard).
+- **Left-click** a Palette char (or widget) = load it as `activeCh` with the
+  **current** pots (pots unchanged).
+- **Left-click** a color swatch in the theme strip = set **fg pot**.
+- **Right-click** a color swatch = set **bg pot**. (Plan §3.4: "Right-click
+  with pencil = pick background color" — same binding inside the canvas:
+  right-click paints nothing, it sets the bg pot from… no: right-click
+  *with pencil on canvas* sets bg pot **to the current fg color**? No —
+  re-read: "Right-click with pencil = pick background color (Playscii
+  convention)". Playscii: right-click paints with bg color. Hmm. **Decision**:
+  right-click on canvas **paints with bg pot** (does not change pots);
+  right-click on a Palette color **sets bg pot**. Both halves documented so
+  the scaffold agent picks one behavior. Open Q4 records the alternative.)
+- **Shift-click / right-click a Palette char** = set it as bg-accent where
+  sensible (plan §4.2): sets `activeCh` AND swaps pots so the char becomes a
+  background fill (used for textured panels: `░ ▒ ▓` + color).
+- **Grab tool / middle-click / `G`** (tools-spec §8): overwrites
+  `activeCh + fg + bg` wholesale from the composed cell under cursor.
+- Pots are per-session + persisted in `config.toml` (`pots = { fg, bg }`);
+  `activeCh` persisted per-file as `paletteTab` + last char (plan §3.2
+  `paletteTab` field — extend to `{ tab, ch }` if cheap, else tab only).
+
+## 4. Keyboard / command-palette surface
+
+- `Ctrl-K →` fuzzy entries: `Palette: <tab>` × 7, `FG: <0–15>`, `BG: <0–15
+  + transparent>`, `Hide Nerds tab` (missing-font fallback, plan §4.7).
+- Typing a printable char with the **pencil** active sets `activeCh`
+  directly (tools-spec §1) — the Palette grid focus ring follows if the char
+  is in the active tab.
+- `L` cycles box style (tools-spec §2), not a palette op, but the Outlines
+  tab highlights the 4 current corner cells while cycling.
+
+## 5. Sortable tab order + persistence
+
+- Tabs reorderable via drag (mouse) or `Ctrl-K → Move tab left/right`.
+- Persisted in `~/.config/omaframe/config.toml`:
+
+```toml
+[palette]
+order = ["outlines", "letters", "symbols", "blocks", "numbers", "nerds", "widgets"]
+active_tab = "outlines"
+pots = { fg = 4, bg = -1 }
+hide_nerds = false          # one-click fallback when font lacks coverage
+```
+
+- Tab ids (stable, lowercase): `letters numbers symbols outlines blocks
+  nerds widgets`. Unknown ids in `order` on load → ignored; missing ids →
+  appended in default order (forward-compatible). Never crash on a hand-edited
+  config — fall back to defaults per-file-key with a status-bar notice
+  (same tolerant-parse policy as theme loading, plan §10).
+- Per-file `paletteTab` (in `.omaframe.json`) overrides `active_tab` when a
+  file is opened; closing/switching files restores the session tab.
+
+## 6. Font test page + missing-glyph fallback (plan §4.7)
+
+- `Settings → Font test page` renders: all Outlines, all Blocks, all Nerds,
+  and one row per widget kind — using the **live terminal**, so missing
+  coverage shows as tofu/width-drift in place.
+- Detection is best-effort only (terminal font is not queryable
+  authoritatively in-terminal; `fc-match` readout + install hint
+  `omarchy install font` / nerdfonts.com link).
+- If Nerds tofu: banner with **Hide Nerds tab** one-click fallback (sets
+  `hide_nerds = true`; tab hidden until re-enabled in settings).
+- Canvas font switching is impossible in-terminal (cell grid is
+  terminal-controlled) — document in the settings copy; the test page IS the
+  preview mechanism.
+
+## 7. Data tables for implementors
+
+Total v1 selectable singles: 52 + 10 + 32 + 27 + 21 = **142** + ~100 Nerds
++ 12 widget kinds.
+
+Snapshot test: assert exact tab lists (order + count + codepoints) against
+this file. Any addition/removal/reorder = intentional spec change: update
+this file first, then the snapshots.

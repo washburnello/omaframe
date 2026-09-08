@@ -1,45 +1,49 @@
-# [asciiflow.com](https://asciiflow.com)
+# omaframe
 
-ASCIIFlow is a client-side only web based application for drawing ASCII diagrams. You can use it at [asciiflow.com](https://asciiflow.com).
+**omaframe** is a native terminal TUI app for sketching TUI wireframes —
+with real terminal characters, real ANSI colors, and real terminal
+constraints (fixed cell grid, monospace, Nerd Font glyphs).
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./assets/asciiflow-scr-dark.png">
-    <source media="(prefers-color-scheme: light)" srcset="./assets/asciiflow-scr-light.png">
-    <img alt="ASCIIFlow screenshot" src="./assets/asciiflow-scr-light.png">
-  </picture>
-</p>
+Omarchy-first. Mouse-friendly. No vim bindings. Clean, simple, intuitive.
 
-## Contributing
+> Fork of [lewish/asciiflow](https://github.com/lewish/asciiflow),
+> reimagined from a web app as a native terminal wireframing tool.
+> See [`plan.md`](./plan.md) for the full vision, architecture, and phased
+> build plan.
 
-### Installation
+## Vision
 
-ASCIIFlow is built with [Bazel](https://docs.bazel.build/versions/4.0.0/getting-started.html).
-Bazel is most easily installed to the correct version through [Bazelisk](https://github.com/bazelbuild/bazelisk). See `.bazelversion` for the correct version if you aren't using Bazelisk.
+What you draw is what the terminal renders: 1 cell = 1 character. No pixel
+canvas, no fake zoom, no proportional fonts on the canvas.
 
-```
-npm install -g @bazel/bazelisk
-yarn global add @bazel/bazelisk
-```
+- **Omarchy-first, canvas-exempt.** App chrome follows the live Omarchy
+  theme; the canvas shows your wireframe's own ANSI-16 colors, with a
+  light/dark preview toggle to check contrast.
+- **Paint-program mental model, not CAD.** Foreground pot + background pot,
+  pencil, eyedropper, big scrolling palette.
+- **Mouse-first.** Click, drag, handles, scroll. Keyboard is shortcuts plus
+  a command palette (`Ctrl-K`) — never modal vim bindings.
+- **Agent-native.** Every wireframe is a `.omaframe.json` file an agent can
+  read, diff, generate, and modify, plus one-shot text export for pasting
+  into a chat window.
 
-For development, ibazel is also a very useful tool to help with automatic rebuilding and reloading.
+## Status
 
-```
-npm install -g @bazel/ibazel
-yarn global add @bazel/ibazel
-```
+**Wave 1: Rust rewrite in progress on this branch** (`omaframe-tui`).
 
-### Running ASCIIFlow locally
+- The native TUI (Rust + Ratatui + crossterm) is being built on this branch.
+- The legacy web code in `client/` (Bazel build) is untouched.
+- `plan.md` is the source of truth for scope and phases; start there.
 
-After installation of Bazel/Bazelisk, you can run ASCIIFlow locally with:
+## Repo layout
 
-```
-ibazel run client:devserver
-```
+- `plan.md` — vision, architecture, UX design, phased build plan.
+- `assets/` — seed data: `nerd.txt` (curated Nerd Font glyph list),
+  `widgets.toml` (widget stamp catalog, see `plan.md` §4.4).
+- `client/` — legacy asciiflow web app (Bazel). Untouched by the rewrite.
 
-Or without ibazel (won't do live reloading):
+## License
 
-```
-bazel run client:devserver
-```
-
+MIT. Upstream license retained as-is — copyright © 2021 Lewis Hemens
+(see [`LICENSE`](./LICENSE)). Attribution to the original project:
+[lewish/asciiflow](https://github.com/lewish/asciiflow).
