@@ -282,6 +282,13 @@ impl Layer {
         })
     }
 
+    /// Stored cell verbatim, **including** transparent deletion markers
+    /// ([`get`](Self::get) filters those out). Used by the TUI to render
+    /// eraser-ghost previews over scratch layers; never used for compose.
+    pub fn get_raw(&self, x: i32, y: i32) -> Option<&Cell> {
+        self.cells.get(&(x, y))
+    }
+
     /// Store a cell verbatim, including transparent deletion markers used
     /// by scratch/patch layers. (Divergence from model-api §2, see module
     /// docs.)

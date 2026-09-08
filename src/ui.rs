@@ -326,6 +326,14 @@ fn render_canvas(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme
             }
             let on_cursor = (doc_x, doc_y) == app.cursor;
             let in_sel = sel.is_some_and(|r| r.contains(doc_x, doc_y));
+            // Eraser preview: erased markers compose as transparent (the old
+            // content shows through), so flag them for inversion — otherwise
+            // the drag rectangle is invisible until commit. (`get` filters
+            // markers out, hence the raw read.)
+            let erased_preview = app
+                .scratch
+                .get_raw(doc_x, doc_y)
+                .is_some_and(|c| c.is_transparent());
             let composed = app.doc.compose(&app.scratch, doc_x, doc_y);
             let mut st = match &composed {
                 Some(c) => theme::cell_style(c.fg, c.bg, t, app.preview_dark),
@@ -337,9 +345,10 @@ fn render_canvas(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme
             };
             if on_cursor {
                 st = cursor_style;
-            } else if in_sel {
-                // Selection rubber-band: tint the surface, keep the glyph.
-                st = st.bg(t.highlight);
+            } else if in_sel || erased_preview {
+                // Rubber-band selections (select tool, eraser rect) render
+                // inverted: swap fg/bg at the terminal level, glyph kept.
+                st = st.add_modifier(Modifier::REVERSED);
             }
             spans.push(Span::styled(glyph, st));
         }
@@ -499,4 +508,71 @@ pub fn render(f: &mut Frame, app: &mut App, t: &theme::Theme) {
     render_palette(f, &areas, app, t);
     render_layers(f, &areas, app, t);
     render_status(f, &areas, app, t);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use omaframe::model::{Cell, Document};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn harness() -> (App, theme::Theme) {
+        let mut doc = Document::new("t", 80, 24);
+        doc.active_layer_mut()
+            .set(2, 1, Cell::new("x", 7, -1));
+        (App::new(doc, None), theme::defaults())
+    }
+
+    fn render_to_buf(app: &mut App, t: &theme::Theme) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(60, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render(f, app, t)).unwrap();
+        term.backend().buffer().clone()
+    }
+
+    /// Screen position of a document cell with the default viewport.
+    fn screen_of(doc_x: i32, doc_y: i32) -> (u16, u16) {
+        let areas = compute_layout(ratatui::layout::Rect::new(0, 0, 60, 12));
+        (
+            areas.canvas.x + doc_x as u16,
+            areas.canvas.y + doc_y as u16,
+        )
+    }
+
+    #[test]
+    fn eraser_drag_inverts_target_cells() {
+        let (mut app, t) = harness();
+        app.set_tool(Tool::Eraser);
+        app.start_stroke(0, 0, false);
+        app.update_stroke(3, 2, false);
+        let buf = render_to_buf(&mut app, &t);
+        // Painted cell under the eraser rect renders inverted (not silently
+        // transparent-looking).
+        let (sx, sy) = screen_of(2, 1);
+        let cell = &buf[(sx, sy)];
+        assert_eq!(cell.symbol(), "x");
+        assert!(
+            cell.modifier.contains(Modifier::REVERSED),
+            "erased cell not inverted: {cell:?}"
+        );
+        // Empty cell inside the rect inverts too.
+        let (ex, ey) = screen_of(0, 0);
+        assert!(buf[(ex, ey)].modifier.contains(Modifier::REVERSED));
+        // Untouched cell outside the rect does not.
+        let (ox, oy) = screen_of(10, 10);
+        assert!(!buf[(ox, oy)].modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn select_rubber_band_inverts() {
+        let (mut app, t) = harness();
+        app.set_tool(Tool::Select);
+        app.start_stroke(5, 5, false);
+        app.update_stroke(7, 6, false);
+        let buf = render_to_buf(&mut app, &t);
+        let (sx, sy) = screen_of(5, 5);
+        assert!(buf[(sx, sy)].modifier.contains(Modifier::REVERSED));
+        let (ox, oy) = screen_of(0, 0);
+        assert!(!buf[(ox, oy)].modifier.contains(Modifier::REVERSED));
+    }
 }
