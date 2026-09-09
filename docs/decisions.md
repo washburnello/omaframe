@@ -35,7 +35,29 @@ from `docs/tools-spec.md` and `skills/omaframe/` so Wave 2 agents are unblocked.
   SKILL.md §2 wording; demo unaffected). SKILL.md to be amended in Wave 2
   if the skill agent's text and model diverge anywhere else.
 
-## Wave 4: user wireframe UI (menu, Colors panel, Pan, borders)
+## Wave 5: updated wireframe (corners, arrows, Layers panel)
+
+- **Corner-flanked titles** everywhere: `┌─┐Tools┌──`, menu
+  `┌─┐New┌─┐Save┌─┐Load┌──`, canvas `┌─┐0,0┌──` (click rects re-derived
+  and tested: New +3/3, Save +9/4, Load +16/4).
+- **Layers panel** bottom-right (`┌─┐Layers┌──`), rows topmost-first with
+  eye + `*` active markers (click = select, first 2 cols = eye). Bottom
+  layers row removed; status bar kept (prompt home + cursor/fg-bg info).
+- **New-file layers** are now `Background/Frames/Text`, painting starts on
+  Frames; loads activate the top layer. `activeLayer` persisted (optional,
+  backward-compatible; old files load top-active) to keep save→load
+  round-trip stable. Schema + SKILL.md updated; demo file untouched as a
+  legacy fixture.
+- **Palette ▲▼ arrows**: last slot of first/last grid rows (prefix rows on
+  Widgets tab), click pages, render/hit share one hint helper. Fixed a
+  real overscroll bug found by the test (scroll clamped in row units —
+  `scroll_palette` now takes cols/visible).
+- **Colors swatches widened to 9 blocks** per mockup (markers kept:
+  `>`/`*`/`#`).
+- QA: 55 tests green (arrows render+hit, layers mapping, chrome
+  snapshot), clippy clean, golden intact, menu build reinstalled.
+- Deviation noted: Colors panel has no ▲▼ affordance yet (17 rows scroll
+  silently); status bar kept though absent from the mockup (prompt home).
 
 User supplied an ASCII wireframe for the app chrome; implemented as spec'd:
 

@@ -360,6 +360,14 @@ fn handle_mouse(
                 app.set_status(format!("palette: {}", app::PALETTE_TABS[tab]));
                 return;
             }
+            if let Some(dir) = ui::hit_palette_scroll(areas, app, col, row) {
+                // Scroll arrows page by nearly a full grid height.
+                let gh = areas.palette_grid.height as usize;
+                let page = gh.saturating_sub(1).max(1) as i32;
+                let cols = ui::palette_grid_cols(areas, app.palette_tab);
+                app.scroll_palette(dir * page, cols, gh);
+                return;
+            }
             if let Some(idx) = ui::hit_palette_grid(areas, app, col, row) {
                 let items = palette_chars(app.palette_tab);
                 if app.palette_tab == 6 {
@@ -372,7 +380,7 @@ fn handle_mouse(
                 }
                 return;
             }
-            if let Some((idx, eye)) = ui::hit_layer(areas, app.doc.layers.len(), col, row) {
+            if let Some((idx, eye)) = ui::hit_layer_row(areas, app.doc.layers.len(), col, row) {
                 if eye {
                     app.toggle_layer_visible(idx);
                 } else {
@@ -431,7 +439,11 @@ fn handle_mouse(
         }
         MouseEventKind::ScrollDown => {
             if ui::over_palette_grid(areas, col, row) {
-                app.scroll_palette(1);
+                app.scroll_palette(
+                    1,
+                    ui::palette_grid_cols(areas, app.palette_tab),
+                    areas.palette_grid.height as usize,
+                );
             } else if ui::over_colors(areas, col, row) {
                 app.scroll_colors(1, areas.colors.height as usize);
             } else if ui::over_canvas(areas, col, row) {
@@ -445,7 +457,11 @@ fn handle_mouse(
         }
         MouseEventKind::ScrollUp => {
             if ui::over_palette_grid(areas, col, row) {
-                app.scroll_palette(-1);
+                app.scroll_palette(
+                    -1,
+                    ui::palette_grid_cols(areas, app.palette_tab),
+                    areas.palette_grid.height as usize,
+                );
             } else if ui::over_colors(areas, col, row) {
                 app.scroll_colors(-1, areas.colors.height as usize);
             } else if ui::over_canvas(areas, col, row) {
@@ -500,7 +516,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         terminal.draw(|f| ui::render(f, &mut app, &theme))?;
         // Keep the cursor visible after keyboard moves.
         {
-            let areas = ui::compute_layout(term_area(tw, th));
+            let areas = ui::compute_layout(term_area(tw, th), app.doc.layers.len());
             app.ensure_cursor_visible(areas.canvas.width as i32, areas.canvas.height as i32);
         }
         if app.should_quit {
@@ -512,7 +528,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 handle_key(&mut app, k.code, k.modifiers);
             }
             Event::Mouse(m) => {
-                let areas = ui::compute_layout(term_area(tw, th));
+                let areas = ui::compute_layout(term_area(tw, th), app.doc.layers.len());
                 handle_mouse(&mut app, &areas, m.kind, m.column, m.row, m.modifiers);
             }
             Event::Resize(w, h) => {

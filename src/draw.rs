@@ -1038,6 +1038,8 @@ mod tests {
         // ┼ with all four arms; erase the right arm's neighbour cell content
         // by deleting the stem cell to the right.
         let mut doc = Document::new("u", 20, 10);
+        // Work explicitly on layer 0 (new docs paint into Frames/1).
+        doc.set_active(0);
         let mut hist = History::new();
         let mut cross = Layer::new();
         cross.set(1, 1, Cell::new("┼", 7, -1));

@@ -49,7 +49,7 @@ pub struct LayoutAreas {
     pub canvas: Rect,
     pub palette_tabs: Rect,
     pub palette_grid: Rect,
-    pub layers: Rect,
+    pub layer_rows: Rect,
     pub status: Rect,
     pub too_small: bool,
 }
@@ -57,12 +57,13 @@ pub struct LayoutAreas {
 /// Pure layout: identical rects for rendering and mouse mapping.
 ///
 /// ```text
-/// row 0: ┌─ Tools ─┐ ┌─ New ─┬─ Save ─┬─ Load ─┐ ┌─ Palette ─┐
-/// row 1: │ tool    │ │ File: …        │ │ tabs    │
-/// row 2: │ …       │ └───────────────┘ │ …       │
+/// row 0: ┌─┐Tools┌─┐ ┌─┐New┌─┐Save┌─┐Load┌─┐ ┌─┐Palette┌─┐
+/// row 1: │ tool    │ │ File: …          │ │ tabs      │
+/// row 2: │ …       │ └────────────────┘ │ …         │
 /// ```
 /// Panels own their border cells; `*_inner` rects below are the content.
-pub fn compute_layout(area: Rect) -> LayoutAreas {
+/// `n_layers` sizes the layers box pinned under the palette.
+pub fn compute_layout(area: Rect, n_layers: usize) -> LayoutAreas {
     if area.width < MIN_W || area.height < MIN_H {
         return LayoutAreas {
             too_small: true,
@@ -73,12 +74,10 @@ pub fn compute_layout(area: Rect) -> LayoutAreas {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(TOOLS_N + 3), // main (tools box needs 13+ rows)
-            Constraint::Length(1),        // layers row
             Constraint::Length(1),        // status bar
         ])
         .split(area);
-    let layers = v[1];
-    let status = v[2];
+    let status = v[1];
     let h = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -120,10 +119,11 @@ pub fn compute_layout(area: Rect) -> LayoutAreas {
         menu_outer.width.saturating_sub(2),
         1,
     );
-    // Menu items live in the top border (see `menu_top_line`): fixed offsets.
+    // Menu items live in the top border (`┌─┐New┌─┐Save┌─┐Load┌──…`):
+    // fixed offsets from the outer left edge.
     let menu_new = Rect::new(menu_outer.x + 3, menu_outer.y, 3, 1);
-    let menu_save = Rect::new(menu_outer.x + 11, menu_outer.y, 4, 1);
-    let menu_load = Rect::new(menu_outer.x + 20, menu_outer.y, 4, 1);
+    let menu_save = Rect::new(menu_outer.x + 9, menu_outer.y, 4, 1);
+    let menu_load = Rect::new(menu_outer.x + 16, menu_outer.y, 4, 1);
     let canvas_outer = Rect::new(
         center_outer.x,
         menu_outer.y + menu_outer.height,
@@ -132,7 +132,19 @@ pub fn compute_layout(area: Rect) -> LayoutAreas {
     );
     let canvas = inset1(canvas_outer);
 
-    // Palette column: one box; tabs + divider + grid inside.
+    // Palette column: palette box on top, layers box pinned to the bottom.
+    // Layers rows display topmost-first; the box is rows + top + bottom.
+    let layer_box_h = (n_layers as u16 + 2).min(palette_outer.height);
+    let layers_outer = Rect::new(
+        palette_outer.x,
+        palette_outer.y + palette_outer.height.saturating_sub(layer_box_h),
+        palette_outer.width,
+        layer_box_h,
+    );
+    let layer_rows = inset1(layers_outer);
+    let palette_box_h = palette_outer
+        .height
+        .saturating_sub(layers_outer.height);
     let palette_tabs = Rect::new(
         palette_outer.x + 1,
         palette_outer.y + 1,
@@ -143,9 +155,7 @@ pub fn compute_layout(area: Rect) -> LayoutAreas {
         palette_outer.x + 1,
         palette_tabs.y + palette_tabs.height + 1, // +1 skips the divider row
         palette_outer.width.saturating_sub(2),
-        palette_outer
-            .height
-            .saturating_sub(1 + 7 + 1 + 1), // top, tabs, divider, bottom
+        palette_box_h.saturating_sub(1 + 7 + 1 + 1), // top, tabs, divider, bottom
     );
 
     LayoutAreas {
@@ -158,7 +168,7 @@ pub fn compute_layout(area: Rect) -> LayoutAreas {
         canvas,
         palette_tabs,
         palette_grid,
-        layers,
+        layer_rows,
         status,
         too_small: false,
     }
@@ -212,6 +222,73 @@ pub fn palette_grid_cols(areas: &LayoutAreas, tab: usize) -> usize {
     }
 }
 
+/// Grid scroll affordances (wireframe `▲`/`▼` at the grid's right edge):
+/// whether more rows exist above/below the visible window. Render and
+/// hit-testing share this so the arrows always agree with clicks.
+pub fn palette_scroll_hint(areas: &LayoutAreas, app: &App) -> (bool, bool) {
+    let gh = areas.palette_grid.height as usize;
+    if gh == 0 {
+        return (false, false);
+    }
+    let len = palette_chars(app.palette_tab).len();
+    if app.palette_tab == 6 {
+        (
+            app.palette_scroll > 0,
+            app.palette_scroll + gh < len,
+        )
+    } else {
+        let cols = palette_grid_cols(areas, app.palette_tab);
+        (
+            app.palette_scroll > 0,
+            (app.palette_scroll + gh) * cols < len,
+        )
+    }
+}
+
+/// Map a click on a scroll arrow to its direction (`-1` up, `+1` down).
+/// Must be consulted before [`hit_palette_grid`]: arrows overwrite item
+/// cells. Row 0's last slot scrolls up; the last row's last slot scrolls
+/// down (up wins when the grid is a single row).
+pub fn hit_palette_scroll(
+    areas: &LayoutAreas,
+    app: &App,
+    col: u16,
+    row: u16,
+) -> Option<i32> {
+    if !contains(areas.palette_grid, col, row) {
+        return None;
+    }
+    let gh = areas.palette_grid.height as usize;
+    if gh == 0 {
+        return None;
+    }
+    let (up, down) = palette_scroll_hint(areas, app);
+    if !up && !down {
+        return None;
+    }
+    let rel_row = (row - areas.palette_grid.y) as usize;
+    if app.palette_tab == 6 {
+        // Widgets tab: arrows prefix the row (first 2 columns).
+        if col >= areas.palette_grid.x + 2 {
+            return None;
+        }
+    } else {
+        // Grid tabs: arrows own the last 2-wide slot.
+        let cols = palette_grid_cols(areas, app.palette_tab);
+        let rel_col = ((col - areas.palette_grid.x) / 2) as usize;
+        if rel_col + 1 != cols {
+            return None;
+        }
+    }
+    if up && rel_row == 0 {
+        return Some(-1);
+    }
+    if down && rel_row == gh - 1 && !(gh == 1 && up) {
+        return Some(1);
+    }
+    None
+}
+
 /// Map a click in the palette grid to a char index into `palette_chars(tab)`.
 pub fn hit_palette_grid(
     areas: &LayoutAreas,
@@ -242,22 +319,24 @@ pub fn hit_palette_grid(
     }
 }
 
-/// Layers row: `Layers:` prefix (7 cols) then fixed 16-wide segments.
-/// Returns `(layer_idx, toggle_eye)` — clicks on the segment's first 2
-/// columns toggle visibility, the rest selects.
-pub const LAYER_PREFIX_W: u16 = 7;
-pub const LAYER_SEG_W: u16 = 16;
-
-pub fn hit_layer(areas: &LayoutAreas, n_layers: usize, col: u16, row: u16) -> Option<(usize, bool)> {
-    if !contains(areas.layers, col, row) || col < areas.layers.x + LAYER_PREFIX_W {
+/// Layers panel rows (bottom-right box): display topmost-first, so display
+/// row `r` is layer `len - 1 - r`. Returns `(layer_idx, toggle_eye)` —
+/// clicks on the row's first 2 columns toggle visibility, the rest selects.
+pub fn hit_layer_row(
+    areas: &LayoutAreas,
+    n_layers: usize,
+    col: u16,
+    row: u16,
+) -> Option<(usize, bool)> {
+    if !contains(areas.layer_rows, col, row) || n_layers == 0 {
         return None;
     }
-    let rel = col - areas.layers.x - LAYER_PREFIX_W;
-    let idx = (rel / LAYER_SEG_W) as usize;
-    if idx >= n_layers {
+    let r = (row - areas.layer_rows.y) as usize;
+    if r >= n_layers {
         return None;
     }
-    let eye = (rel % LAYER_SEG_W) < 2;
+    let idx = n_layers - 1 - r;
+    let eye = col < areas.layer_rows.x + 2;
     Some((idx, eye))
 }
 
@@ -322,19 +401,16 @@ pub fn over_canvas(areas: &LayoutAreas, col: u16, row: u16) -> bool {
 // Rendering
 // ---------------------------------------------------------------------------
 
-fn chrome_title_style(t: &theme::Theme) -> Style {
-    Style::default().fg(t.accent).add_modifier(Modifier::BOLD)
-}
-
 // ---------------------------------------------------------------------------
 // Panel frames (wireframe chrome: titled box borders around every panel)
 // ---------------------------------------------------------------------------
 
-/// Top border with an embedded title: `┌─ {title} ───┐`, exactly `w + 2`
-/// cells wide. Title is ASCII-short; truncation keeps the width exact.
-fn top_with_title(w: usize, title: &str) -> String {
+/// Top border with a corner-flanked title: `┌─┐{title}┌──…──┐`, exactly
+/// `w + 2` cells wide (wireframe chrome: the title sits between corners).
+/// Title is ASCII-short; truncation keeps the width exact.
+fn top_titled(w: usize, title: &str) -> String {
     let t = truncate_to(title, w.saturating_sub(4));
-    let mut s = format!("┌─ {t} ");
+    let mut s = format!("┌─┐{t}┌");
     while s.chars().count() < w + 1 {
         s.push('─');
     }
@@ -397,18 +473,18 @@ fn render_menu(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme) 
     let w = areas.menu_top.width as usize;
     let dim = Style::default().fg(t.dim);
     let item = Style::default().fg(t.fg).add_modifier(Modifier::BOLD);
-    // Item labels sit at fixed offsets (see compute_layout): the spans
-    // below must reproduce them exactly for click mapping.
+    // Wireframe menu chrome (`┌─┐New┌─┐Save┌─┐Load┌──…`): the label spans
+    // below must reproduce these offsets exactly for click mapping.
     let mut spans = vec![
-        Span::styled("┌─ ", dim),
+        Span::styled("┌─┐", dim),
         Span::styled("New", item),
-        Span::styled(" ─┬─ ", dim),
+        Span::styled("┌─┐", dim),
         Span::styled("Save", item),
-        Span::styled(" ─┬─ ", dim),
+        Span::styled("┌─┐", dim),
         Span::styled("Load", item),
-        Span::styled(" ─", dim),
+        Span::styled("┌", dim),
     ];
-    let used: usize = "┌─ New ─┬─ Save ─┬─ Load ─".chars().count();
+    let used: usize = "┌─┐New┌─┐Save┌─┐Load┌".chars().count();
     if w + 2 > used {
         spans.push(Span::styled(
             "─".repeat(w + 2 - used - 1) + "┐",
@@ -455,7 +531,7 @@ fn render_tools(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme)
         f,
         outer,
         Line::from(Span::styled(
-            top_with_title(w, "Tools"),
+            top_titled(w, "Tools"),
             Style::default().fg(t.dim),
         )),
         t,
@@ -511,7 +587,7 @@ fn render_canvas(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme
         f,
         outer,
         Line::from(Span::styled(
-            top_with_title(w, &origin),
+            top_titled(w, &origin),
             Style::default().fg(t.dim),
         )),
         t,
@@ -582,7 +658,7 @@ fn render_palette(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Them
         f,
         outer,
         Line::from(Span::styled(
-            top_with_title(w, "Palette"),
+            top_titled(w, "Palette"),
             Style::default().fg(t.dim),
         )),
         t,
@@ -602,12 +678,18 @@ fn render_palette(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Them
         )]));
     }
     f.render_widget(Paragraph::new(tab_lines), areas.palette_tabs);
-    // Grid.
+    // Grid (scroll arrows overwrite the last slot of the first/last row).
     let items = palette_chars(app.palette_tab);
     let cols = palette_grid_cols(areas, app.palette_tab);
     let gh = areas.palette_grid.height as usize;
+    let (up, down) = palette_scroll_hint(areas, app);
+    let down_row_only = down && !(gh == 1 && up);
+    let arrow_style = Style::default()
+        .fg(t.accent)
+        .add_modifier(Modifier::BOLD);
     let mut lines: Vec<Line> = Vec::new();
     if app.palette_tab == 6 {
+        let gw = areas.palette_grid.width as usize;
         for r in 0..gh {
             let idx = app.palette_scroll + r;
             if idx >= items.len() {
@@ -615,12 +697,29 @@ fn render_palette(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Them
                 continue;
             }
             let style = Style::default().fg(t.fg);
-            lines.push(Line::from(vec![Span::styled(items[idx].clone(), style)]));
+            if up && r == 0 {
+                lines.push(Line::from(vec![
+                    Span::styled("▲ ", arrow_style),
+                    Span::styled(truncate_to(&items[idx], gw.saturating_sub(2)), style),
+                ]));
+            } else if down_row_only && r == gh - 1 {
+                lines.push(Line::from(vec![
+                    Span::styled("▼ ", arrow_style),
+                    Span::styled(truncate_to(&items[idx], gw.saturating_sub(2)), style),
+                ]));
+            } else {
+                lines.push(Line::from(vec![Span::styled(items[idx].clone(), style)]));
+            }
         }
     } else {
         for r in 0..gh {
             let mut spans: Vec<Span> = Vec::new();
+            let arrow_row = (up && r == 0) || (down_row_only && r == gh - 1);
             for c in 0..cols {
+                if arrow_row && c + 1 == cols {
+                    spans.push(Span::styled(if up && r == 0 { "▲ " } else { "▼ " }, arrow_style));
+                    continue;
+                }
                 let idx = (app.palette_scroll + r) * cols + c;
                 if idx >= items.len() {
                     break;
@@ -663,7 +762,7 @@ fn render_colors(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme
         f,
         outer,
         Line::from(Span::styled(
-            top_with_title(w, "Colors"),
+            top_titled(w, "Colors"),
             Style::default().fg(t.dim),
         )),
         t,
@@ -694,7 +793,7 @@ fn render_colors(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme
         lines.push(Line::from(vec![
             Span::styled(mark.to_string(), Style::default().fg(t.fg)),
             Span::styled(
-                "████████",
+                "█████████",
                 Style::default().fg(t.ansi[slot as usize]).bg(t.bg),
             ),
         ]));
@@ -704,26 +803,47 @@ fn render_colors(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme
     render_bottom_row(f, outer, w, t);
 }
 
-fn render_layers(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme) {
-    let mut spans = vec![Span::styled("Layers:", chrome_title_style(t))];
-    for (i, nl) in app.doc.layers.iter().enumerate() {
+/// Layers panel (bottom-right box, wireframe `┌─┐Layers┌──┐`): one row per
+/// layer, topmost first — `{eye}{active} {name}`.
+fn render_layers_panel(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme) {
+    let outer = outer_of(areas.layer_rows);
+    let w = areas.layer_rows.width as usize;
+    if outer.height < 3 || w == 0 {
+        return;
+    }
+    render_top_row(
+        f,
+        outer,
+        Line::from(Span::styled(
+            top_titled(w, "Layers"),
+            Style::default().fg(t.dim),
+        )),
+        t,
+    );
+    let n = app.doc.layers.len();
+    let mut lines: Vec<Line> = Vec::new();
+    for r in 0..areas.layer_rows.height as usize {
+        if r >= n {
+            lines.push(Line::from(""));
+            continue;
+        }
+        let idx = n - 1 - r;
+        let nl = &app.doc.layers[idx];
         let eye = if nl.visible { "▣" } else { "▢" };
-        let active = i == app.doc.active;
-        let seg = format!("{} {:<10}{} ", eye, truncate_to(&nl.name, 10), if active { "*" } else { " " });
-        let seg = truncate_to(&seg, LAYER_SEG_W as usize);
-        let padded = format!("{:<width$}", seg, width = LAYER_SEG_W as usize);
+        let active = idx == app.doc.active;
         let style = if active {
             Style::default().bg(t.accent).fg(t.bg).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(t.fg)
         };
-        spans.push(Span::styled(padded, style));
+        lines.push(Line::from(vec![Span::styled(
+            truncate_to(&format!("{}{} {}", eye, if active { "*" } else { " " }, nl.name), w),
+            style,
+        )]));
     }
-    let w = areas.layers.width as usize;
-    let line = Line::from(spans);
-    let text = line.to_string();
-    let _ = (w, text);
-    f.render_widget(Paragraph::new(line), areas.layers);
+    f.render_widget(Paragraph::new(lines), areas.layer_rows);
+    panel_sides(f, outer, t);
+    render_bottom_row(f, outer, w, t);
 }
 
 fn render_status(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme) {
@@ -775,7 +895,7 @@ fn render_status(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme
 /// shows a one-line guard message instead of the full layout.
 pub fn render(f: &mut Frame, app: &mut App, t: &theme::Theme) {
     let area = f.area();
-    let areas = compute_layout(area);
+    let areas = compute_layout(area, app.doc.layers.len());
     if areas.too_small {
         let msg = format!(
             "terminal too small: need {}x{}, have {}x{} — enlarge to draw",
@@ -789,7 +909,7 @@ pub fn render(f: &mut Frame, app: &mut App, t: &theme::Theme) {
     render_colors(f, &areas, app, t);
     render_canvas(f, &areas, app, t);
     render_palette(f, &areas, app, t);
-    render_layers(f, &areas, app, t);
+    render_layers_panel(f, &areas, app, t);
     render_status(f, &areas, app, t);
 }
 
@@ -815,7 +935,7 @@ mod tests {
 
     /// Screen position of a document cell with the default viewport.
     fn screen_of(doc_x: i32, doc_y: i32) -> (u16, u16) {
-        let areas = compute_layout(ratatui::layout::Rect::new(0, 0, 80, 24));
+        let areas = compute_layout(ratatui::layout::Rect::new(0, 0, 80, 24), 3);
         (
             areas.canvas.x + doc_x as u16,
             areas.canvas.y + doc_y as u16,
@@ -826,13 +946,13 @@ mod tests {
     fn wireframe_layout_menu_panels_canvas() {
         // 80x24: the wireframe arrangement — menu block over the canvas,
         // tools + colors stacked left, palette right.
-        let a = compute_layout(ratatui::layout::Rect::new(0, 0, 80, 24));
+        let a = compute_layout(ratatui::layout::Rect::new(0, 0, 80, 24), 3);
         assert!(!a.too_small);
         // Menu items sit inside the top border at fixed offsets.
         assert_eq!((a.menu_new.x, a.menu_new.y), (a.menu_top.x + 2, a.menu_top.y));
         assert_eq!(a.menu_new.width, 3);
-        assert_eq!((a.menu_save.x, a.menu_save.width), (a.menu_top.x + 10, 4));
-        assert_eq!((a.menu_load.x, a.menu_load.width), (a.menu_top.x + 19, 4));
+        assert_eq!((a.menu_save.x, a.menu_save.width), (a.menu_top.x + 8, 4));
+        assert_eq!((a.menu_load.x, a.menu_load.width), (a.menu_top.x + 15, 4));
         assert_eq!(hit_menu(&a, a.menu_new.x + 1, a.menu_new.y), Some(MenuAction::New));
         assert_eq!(hit_menu(&a, a.menu_save.x, a.menu_save.y), Some(MenuAction::Save));
         assert_eq!(hit_menu(&a, a.menu_load.x + 3, a.menu_load.y), Some(MenuAction::Load));
@@ -885,12 +1005,70 @@ mod tests {
             "Tools", "pan",        // tools box + Pan tool
             "Colors", "none",      // colors box + transparent row
             "Palette", "Outline", "Glyphs", // palette box + renamed tabs
+            "Layers",              // layers panel
             "0,0",                 // canvas origin in its border
             "untitled",            // file row
             "┌", "┐", "└", "┘", "│", "─", // box chrome
         ] {
             assert!(screen.contains(needle), "missing {needle:?}:\n{screen}");
         }
+    }
+
+    #[test]
+    fn palette_scroll_arrows_render_and_hit() {
+        // Glyphs tab overflows the grid: ▼ on the last row, nothing on top.
+        let (mut app, t) = harness();
+        app.set_palette_tab(5);
+        let buf = render_to_buf(&mut app, &t);
+        let areas = compute_layout(ratatui::layout::Rect::new(0, 0, 80, 24), 3);
+        let (up, down) = palette_scroll_hint(&areas, &app);
+        assert!(!up && down);
+        let gx = areas.palette_grid.x;
+        let cols = palette_grid_cols(&areas, 5);
+        let arrow_x = gx + ((cols - 1) * 2) as u16;
+        let last_y = areas.palette_grid.y + areas.palette_grid.height - 1;
+        assert_eq!(buf[(arrow_x, last_y)].symbol(), "▼");
+        assert_eq!(
+            hit_palette_scroll(&areas, &app, arrow_x, last_y),
+            Some(1)
+        );
+        // Plain item cells still pick.
+        assert_eq!(hit_palette_scroll(&areas, &app, gx, last_y), None);
+        assert!(hit_palette_grid(&areas, &app, gx, last_y).is_some());
+        // Scrolled to the bottom: ▲ appears, ▼ disappears.
+        app.scroll_palette(10_000, cols, areas.palette_grid.height as usize);
+        let (up2, down2) = palette_scroll_hint(&areas, &app);
+        assert!(up2 && !down2);
+        let buf2 = render_to_buf(&mut app, &t);
+        assert_eq!(buf2[(arrow_x, areas.palette_grid.y)].symbol(), "▲");
+        assert_eq!(
+            hit_palette_scroll(&areas, &app, arrow_x, areas.palette_grid.y),
+            Some(-1)
+        );
+    }
+
+    #[test]
+    fn layers_panel_maps_topmost_first() {
+        let (app, _) = harness();
+        // Harness doc has the 3 default layers; rows show topmost first.
+        let a = compute_layout(ratatui::layout::Rect::new(0, 0, 80, 24), 3);
+        assert_eq!(a.layer_rows.height, 3);
+        let y0 = a.layer_rows.y;
+        // Row 0 → Text (top, idx 2); row 2 → Background (idx 0).
+        assert_eq!(
+            hit_layer_row(&a, 3, a.layer_rows.x + 5, y0),
+            Some((2, false))
+        );
+        assert_eq!(
+            hit_layer_row(&a, 3, a.layer_rows.x + 5, y0 + 2),
+            Some((0, false))
+        );
+        // First two columns toggle the eye.
+        assert_eq!(
+            hit_layer_row(&a, 3, a.layer_rows.x, y0 + 1),
+            Some((1, true))
+        );
+        assert_eq!(hit_layer_row(&a, 3, a.layer_rows.x, y0 + 3), None);
     }
 
     #[test]

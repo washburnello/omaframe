@@ -434,9 +434,15 @@ impl App {
         }
     }
 
-    pub fn scroll_palette(&mut self, dir: i32) {
+    /// Scroll the palette grid by `dir` rows. `cols`/`visible` describe the
+    /// on-screen grid (row count = ceil(items / cols)); the scroll clamps so
+    /// the last content row stays reachable without scrolling into the void.
+    pub fn scroll_palette(&mut self, dir: i32, cols: usize, visible: usize) {
+        let len = palette_chars(self.palette_tab).len();
+        let total_rows = len.div_ceil(cols.max(1)).max(1);
+        let max = total_rows.saturating_sub(visible.max(1));
         let next = self.palette_scroll as i32 + dir;
-        self.palette_scroll = next.max(0) as usize;
+        self.palette_scroll = next.clamp(0, max as i32) as usize;
     }
 
     pub fn cycle_box_style(&mut self) {

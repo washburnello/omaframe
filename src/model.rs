@@ -45,7 +45,7 @@
 //! 3. `Document` additionally carries `name` and `palette_tab` (both in the
 //!    schema, needed for a faithful round-trip). The file's `active` layer
 //!    is runtime-only: the schema has no such field, so saves omit it and
-//!    loads reset it to `0`.
+//!    loads reset it to the top layer.
 //! 4. `Widget` keeps schema-faithful `kind`/`label`/`style` strings instead
 //!    of strict `WidgetKind`/`WidgetStyle`/`WidgetState` enums (the schema's
 //!    `style` values such as `"checked"` are state, not a border style, so
@@ -512,10 +512,11 @@ pub struct Document {
     pub name: String,
     /// Grid size `(w, h)`; new files default to 80×24.
     pub grid: (u32, u32),
-    /// Layer stack, index 0 = bottom. Defaults: `["wireframe", "labels"]`.
+    /// Layer stack, index 0 = bottom. Defaults: `["Background", "Frames",
+    /// "Text"]` (structure goes on Frames, labels on Text).
     pub layers: Vec<NamedLayer>,
     /// Index of the layer tools paint into. Runtime-only: not serialized
-    /// (the schema has no such field); loads reset it to `0`.
+    /// (the schema has no such field); loads reset it to the top layer.
     pub active: usize,
     /// Parametric widget stamps (stored, not rendered by the model).
     pub widgets: Vec<Widget>,
@@ -526,26 +527,31 @@ pub struct Document {
 }
 
 impl Document {
-    /// New `w`×`h` document with empty `wireframe` + `labels` layers,
-    /// dark preview, and the `outlines` palette tab. Zero dimensions clamp
-    /// to 1.
+    /// New `w`×`h` document with empty `Background` + `Frames` + `Text`
+    /// layers (painting starts on Frames), dark preview, and the `outlines`
+    /// palette tab. Zero dimensions clamp to 1.
     pub fn new(name: impl Into<String>, w: u32, h: u32) -> Self {
         Self {
             name: name.into(),
             grid: (w.max(1), h.max(1)),
             layers: vec![
                 NamedLayer {
-                    name: "wireframe".to_string(),
+                    name: "Background".to_string(),
                     visible: true,
                     layer: Layer::new(),
                 },
                 NamedLayer {
-                    name: "labels".to_string(),
+                    name: "Frames".to_string(),
+                    visible: true,
+                    layer: Layer::new(),
+                },
+                NamedLayer {
+                    name: "Text".to_string(),
                     visible: true,
                     layer: Layer::new(),
                 },
             ],
-            active: 0,
+            active: 1,
             widgets: Vec::new(),
             preview_dark: true,
             palette_tab: "outlines".to_string(),
@@ -869,8 +875,9 @@ impl Default for FilePreview {
 }
 
 /// Shadow of the on-disk schema: field order matches `schema.json`
-/// (`version, name, grid, layers, widgets, preview, paletteTab`) so saves
-/// are deterministic. Unknown keys are ignored on load (forward-compat).
+/// (`version, name, grid, layers, widgets, preview, paletteTab,
+/// activeLayer`) so saves are deterministic. Unknown keys are ignored on
+/// load (forward-compat).
 #[derive(Debug, Serialize, Deserialize)]
 struct FileDoc {
     version: u32,
@@ -883,6 +890,9 @@ struct FileDoc {
     preview: FilePreview,
     #[serde(default = "default_palette_tab", rename = "paletteTab")]
     palette_tab: String,
+    /// Paint-target layer; absent in older files (defaults to top).
+    #[serde(default, rename = "activeLayer")]
+    active_layer: Option<usize>,
 }
 
 fn check_cell_shape(ch: &str) -> Result<(), ModelError> {
@@ -957,11 +967,15 @@ fn file_doc_to_document(fd: FileDoc) -> Result<Document, ModelError> {
             style: fw.style.clone(),
         });
     }
+    // Paint-target layer: stored when present, else the top layer (older
+    // files predate the field). Out-of-range values clamp to the top.
+    let top = layers.len().saturating_sub(1);
+    let active = fd.active_layer.map(|a| a.min(top)).unwrap_or(top);
     Ok(Document {
         name: fd.name,
         grid: (fd.grid.w, fd.grid.h),
         layers,
-        active: 0,
+        active,
         widgets,
         preview_dark: fd.preview.dark,
         palette_tab: fd.palette_tab,
@@ -1031,6 +1045,7 @@ fn document_to_file_doc(doc: &Document) -> Result<FileDoc, ModelError> {
             dark: doc.preview_dark,
         },
         palette_tab: doc.palette_tab.clone(),
+        active_layer: Some(doc.active),
     })
 }
 
@@ -1627,7 +1642,9 @@ mod tests {
         assert!(lines[0].starts_with("z"), "negative-origin row exports");
         assert!(lines[52].ends_with('y'), "far cell exports past grid");
         // Hidden layers don't count.
-        doc.layers[0].visible = false;
+        for nl in &mut doc.layers {
+            nl.visible = false;
+        }
         assert_eq!(content_bounds(&doc), None);
     }
 

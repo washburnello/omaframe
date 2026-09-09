@@ -28,7 +28,7 @@
     "layers": {
       "type": "array",
       "minItems": 1,
-      "description": "Stacked layers, bottom first. Suggested default: [wireframe, labels].",
+      "description": "Stacked layers, bottom first (index 0 = bottom). Suggested default: [Background, Frames, Text].",
       "items": {
         "type": "object",
         "required": ["name", "visible", "cells"],
@@ -107,6 +107,11 @@
       "type": "string",
       "minLength": 1,
       "description": "Last-active Palette tab name, e.g. \"outlines\"."
+    },
+    "activeLayer": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Optional paint-target layer index (bottom-first). Absent in older files, which load with the top layer active; out-of-range values clamp to the top."
     }
   }
 }

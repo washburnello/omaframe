@@ -23,10 +23,11 @@ Top-level object:
 | `version` | integer | yes | Always `1` in v1. |
 | `name` | string | yes | Wireframe name, e.g. `"settings-panel"`. |
 | `grid` | `{w, h}` | yes | Grid size in cells. 1 cell = 1 terminal character. Soft cap 500x200. |
-| `layers` | array | yes | Bottom layer first. Default pair: `wireframe` (structure) + `labels` (text overlay). |
+| `layers` | array | yes | Bottom layer first. Default trio: `Background` + `Frames` (structure) + `Text` (labels). |
 | `widgets` | array | no | Parametric entities (`{kind, x, y, w, h, label?, style?}`); the resize/relabel source of truth. `layers` holds the baked cells used for export. |
 | `preview` | `{dark?}` | no | Dark/light canvas-background hint. Flips the background surface only; wireframe colors never change. |
 | `paletteTab` | string | no | Last-active Palette tab (e.g. `"outlines"`). Informational only. |
+| `activeLayer` | integer | no | Paint-target layer index (bottom-first). Absent in older files (= top layer active). |
 
 Layer: `{name, visible, cells[]}`. `visible: false` layers are skipped when
 composing. **Always preserve existing layer names** — tools and undo history
@@ -51,10 +52,10 @@ Transparency and compose ("top-wins"):
   transparency character.
 - Compose order: layers array order, bottom first — the **topmost visible
   layer with a non-transparent cell wins** at each position.
-- Typical pattern: the `wireframe` layer draws full borders/widget frames and
-  the `labels` layer overwrites spans of them with text (e.g. a title sitting
+- Typical pattern: the `Frames` layer draws full borders/widget frames and
+  the `Text` layer overwrites spans of them with text (e.g. a title sitting
   on the top border). That is how `testdata/demo.omaframe.json` works: the
-  `Settings` title cells live in `labels` and cover the `─` cells beneath them.
+  `Settings` title cells live in `Text` and cover the `─` cells beneath them.
 
 ## 2. How to render to text
 
@@ -88,12 +89,12 @@ its baked cells.
 
 - **Move** = recompute coordinates. Shift every affected cell by `(dx, dy)`
   and update the matching `widgets[]` `{x, y}`. Touch all layers that contain
-  parts of the moved object (e.g. brackets in `wireframe`, letters in
-  `labels`). Delete entries that would leave the grid instead of clamping
+  parts of the moved object (e.g. brackets in `Frames`, letters in
+  `Text`). Delete entries that would leave the grid instead of clamping
   them into place silently — or rather: refuse and report; never wrap.
 - **Recolor** = change `fg` (or `bg`) indices in place. Coordinates and `ch`
   stay identical. Example: selected-state highlight = `fg 7` -> `fg 6`.
-- **Label** = append cells to the topmost text layer (`labels`): one cell per
+- **Label** = append cells to the topmost text layer (`Text`): one cell per
   character, starting at the label's `(x, y)`, skipping spaces (transparent —
   do not store them). Overwriting border cells underneath is expected and
   correct (top-wins).
@@ -106,8 +107,8 @@ confirm only the intended lines changed.
 1. **Stay in the grid.** `0 <= x < w`, `0 <= y < h`. No wrapping, no negative
    coordinates, no resizing the grid to fit a misplaced edit.
 2. **Keep layer names.** Never rename, delete, or reorder layers unless asked.
-   Paint into the layer that owns the object kind (structure -> `wireframe`,
-   words -> `labels`).
+   Paint into the layer that owns the object kind (structure -> `Frames`,
+   words -> `Text`).
 3. **Only Palette codepoints.** Use characters from the Palette tabs
    (Letters, Numbers, Symbols, Outlines, Blocks, curated Nerds, widget kit).
    Never invent codepoints, emoji, or lookalike glyphs. Box drawing:
@@ -136,8 +137,9 @@ doc = json.load(open("testdata/demo.omaframe.json"))
 print(doc["grid"], [l["name"] for l in doc["layers"]], len(doc["widgets"]))
 ```
 
-Patch (move the OK button at `(5, 2)` right by 1: brackets in `wireframe`,
-letters in `labels`, plus the `widgets[]` entry):
+Patch (move the OK button at `(5, 2)` right by 1: brackets in the structure
+layer, letters in the text layer — `wireframe`/`labels` in this demo file,
+`Frames`/`Text` in new files — plus the `widgets[]` entry):
 
 ```python
 import json
