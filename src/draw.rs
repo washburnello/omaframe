@@ -576,7 +576,55 @@ fn connection_glyph(up: bool, down: bool, left: bool, right: bool) -> Option<&'s
     }
 }
 
-/// Junction auto-connect + 2-pass normalization, folded into `scratch`.
+/// Mutual-connection directions of the committed light-box cell at
+/// `(x, y)`: a direction counts when the neighbour is a light-box cell
+/// that connects back AND this cell connects toward it (mirrors the
+/// `snap_patch` connect rule). Empty for non-line cells.
+fn mutual_dirs(layer: &Layer, x: i32, y: i32) -> Vec<(i32, i32)> {
+    let Some(cell) = layer.get(x, y) else {
+        return Vec::new();
+    };
+    if !is_light_box(&cell.ch) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for d in ALL_DIRS {
+        let (ax, ay) = (x + d.0, y + d.1);
+        let Some(adj) = layer.get(ax, ay) else {
+            continue;
+        };
+        if !is_light_box(&adj.ch) {
+            continue;
+        }
+        if connects(&cell.ch, d) && connects(&adj.ch, opposite(d)) {
+            out.push(d);
+        }
+    }
+    out
+}
+
+/// Line endpoint at `(x, y)` in `doc` layer `layer_idx`: `Some((tip,
+/// anchor))` when the committed cell is a light-box cell with exactly one
+/// mutual connection (a draggable tip; `anchor` is the neighbour to redraw
+/// from). `None` for junctions, isolated stubs, text, arrows, and styled
+/// cells. Out-of-range layers yield `None`.
+pub fn line_endpoint(
+    doc: &Document,
+    layer_idx: usize,
+    x: i32,
+    y: i32,
+) -> Option<((i32, i32), (i32, i32))> {
+    if layer_idx >= doc.layers.len() {
+        return None;
+    }
+    let dirs = mutual_dirs(&doc.layers[layer_idx].layer, x, y);
+    if dirs.len() == 1 {
+        let d = dirs[0];
+        Some(((x, y), (x + d.0, y + d.1)))
+    } else {
+        None
+    }
+}
 ///
 /// Port of `client/snap.ts` restricted to the light set:
 ///
@@ -784,6 +832,48 @@ mod tests {
 
     fn commit_scratch(doc: &mut Document, hist: &mut History, scratch: &Layer) -> bool {
         hist.commit(doc, scratch)
+    }
+
+    fn committed_doc(cells: &[((i32, i32), &str)]) -> Document {
+        let mut doc = Document::new("t", 80, 24);
+        let mut patch = Layer::new();
+        for ((x, y), ch) in cells {
+            patch.set(*x, *y, Cell::new(*ch, DRAW_FG.clone(), DRAW_BG.clone()));
+        }
+        let mut hist = History::new();
+        hist.commit_layer(&mut doc, 0, &patch, None);
+        doc
+    }
+
+    #[test]
+    fn line_endpoint_detects_tips_not_junctions() {
+        // L-shape: (0,0)──(2,0) with leg down to (2,2). Tips at (0,0)
+        // (anchor (1,0)) and (2,2) (anchor (2,1)); corner + middle are not.
+        let doc = committed_doc(&[
+            ((0, 0), "─"),
+            ((1, 0), "─"),
+            ((2, 0), "┐"),
+            ((2, 1), "│"),
+            ((2, 2), "│"),
+        ]);
+        // Note: (2,2) │ has only an UP mutual connection → endpoint.
+        assert_eq!(
+            line_endpoint(&doc, 0, 0, 0),
+            Some(((0, 0), (1, 0)))
+        );
+        assert_eq!(
+            line_endpoint(&doc, 0, 2, 2),
+            Some(((2, 2), (2, 1)))
+        );
+        assert_eq!(line_endpoint(&doc, 0, 2, 0), None, "corner");
+        assert_eq!(line_endpoint(&doc, 0, 1, 0), None, "middle");
+        assert_eq!(line_endpoint(&doc, 0, 9, 9), None, "empty");
+        // Text and arrows never qualify.
+        let doc = committed_doc(&[((0, 0), "x"), ((5, 5), "►")]);
+        assert_eq!(line_endpoint(&doc, 0, 0, 0), None);
+        assert_eq!(line_endpoint(&doc, 0, 5, 5), None);
+        // Out-of-range layer.
+        assert_eq!(line_endpoint(&doc, 9, 0, 0), None);
     }
 
     #[test]

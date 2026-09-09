@@ -569,10 +569,10 @@ fn handle_mouse(
             if let Some(idx) = ui::hit_palette_grid(areas, app, col, row) {
                 let items = app.palette_visible();
                 if app.palette_tab == 6 {
-                    app.set_status(format!(
-                        "widget '{}': coming in Phase 3",
-                        items.get(idx).map(String::as_str).unwrap_or("?")
-                    ));
+                    if let Some(kind) = items.get(idx) {
+                        app.arm_widget(kind);
+                    }
+                    return;
                 } else if let Some(s) = items.get(idx) {
                     app.pick_palette_char(s);
                 }
@@ -589,6 +589,9 @@ fn handle_mouse(
             if let Some(pos) = ui::hit_canvas(areas, app, col, row) {
                 if app.tool == Tool::Pan {
                     app.start_pan(col, row);
+                } else if app.pending_widget.is_some() {
+                    // Armed widget stamp bypasses the active tool.
+                    app.start_stamp(pos.0, pos.1, shift);
                 } else {
                     handle_canvas_press(app, pos, shift);
                 }

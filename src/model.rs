@@ -735,7 +735,8 @@ impl Document {
 /// One undo entry: the inverse patch for a single layer plus the selection
 /// captured before the gesture (port of the parallel `_undoLayers` /
 /// `_undoSelections` stacks in `canvas.ts`, kept in one struct so the two
-/// can never desync).
+/// can never desync). Widget gestures additionally snapshot the widget
+/// list so stamp/move/resize undo as one entry with their cells.
 #[derive(Clone, Debug)]
 pub struct HistoryEntry {
     /// Which layer the diff applies to (per-layer aware).
@@ -744,6 +745,8 @@ pub struct HistoryEntry {
     pub diff: Layer,
     /// Selection captured before the gesture (restored on undo).
     pub selection: Option<Rect>,
+    /// Widget list before the gesture (`None` = untouched by it).
+    pub widgets_before: Option<Vec<Widget>>,
 }
 
 /// Diff-stack undo/redo plus the live selection and the pending
@@ -783,6 +786,21 @@ impl History {
         patch: &Layer,
         selection: Option<Rect>,
     ) -> bool {
+        self.commit_full(doc, layer_idx, patch, selection, None)
+    }
+
+    /// Full commit: like [`History::commit_layer`] but additionally
+    /// snapshots the widget list. `widgets_before` is the list as it was
+    /// before the gesture (`None` = the gesture does not touch widgets);
+    /// undo/redo swap the whole vec so stamp/move/resize are single-entry.
+    pub fn commit_full(
+        &mut self,
+        doc: &mut Document,
+        layer_idx: usize,
+        patch: &Layer,
+        selection: Option<Rect>,
+        widgets_before: Option<Vec<Widget>>,
+    ) -> bool {
         if layer_idx >= doc.layers.len() {
             return false;
         }
@@ -792,6 +810,21 @@ impl History {
                     layer_idx,
                     diff,
                     selection,
+                    widgets_before,
+                });
+                if self.undo.len() > MAX_UNDO {
+                    self.undo.drain(..self.undo.len() - MAX_UNDO);
+                }
+                true
+            }
+            // Empty cell diff but a widget change still deserves an entry
+            // (e.g. a stamp whose cells matched, or a pure relabel).
+            None if widgets_before.is_some() => {
+                self.undo.push(HistoryEntry {
+                    layer_idx,
+                    diff: Layer::new(),
+                    selection,
+                    widgets_before,
                 });
                 if self.undo.len() > MAX_UNDO {
                     self.undo.drain(..self.undo.len() - MAX_UNDO);
@@ -818,11 +851,23 @@ impl History {
             .layer
             .apply(&entry.diff)
             .unwrap_or_default();
-        self.redo.push(HistoryEntry {
-            layer_idx: entry.layer_idx,
-            diff: redo_diff,
-            selection: self.selection,
-        });
+        if entry.widgets_before.is_some() {
+            let cur_widgets = std::mem::take(&mut doc.widgets);
+            doc.widgets = entry.widgets_before.unwrap_or_default();
+            self.redo.push(HistoryEntry {
+                layer_idx: entry.layer_idx,
+                diff: redo_diff,
+                selection: self.selection,
+                widgets_before: Some(cur_widgets),
+            });
+        } else {
+            self.redo.push(HistoryEntry {
+                layer_idx: entry.layer_idx,
+                diff: redo_diff,
+                selection: self.selection,
+                widgets_before: None,
+            });
+        }
         self.selection = entry.selection;
         true
     }
@@ -841,11 +886,23 @@ impl History {
             .layer
             .apply(&entry.diff)
             .unwrap_or_default();
-        self.undo.push(HistoryEntry {
-            layer_idx: entry.layer_idx,
-            diff: undo_diff,
-            selection: self.selection,
-        });
+        if entry.widgets_before.is_some() {
+            let cur_widgets = std::mem::take(&mut doc.widgets);
+            doc.widgets = entry.widgets_before.unwrap_or_default();
+            self.undo.push(HistoryEntry {
+                layer_idx: entry.layer_idx,
+                diff: undo_diff,
+                selection: self.selection,
+                widgets_before: Some(cur_widgets),
+            });
+        } else {
+            self.undo.push(HistoryEntry {
+                layer_idx: entry.layer_idx,
+                diff: undo_diff,
+                selection: self.selection,
+                widgets_before: None,
+            });
+        }
         if self.undo.len() > MAX_UNDO {
             self.undo.drain(..self.undo.len() - MAX_UNDO);
         }
@@ -1605,8 +1662,43 @@ mod tests {
     }
 
     #[test]
-    fn new_commit_clears_redo() {
+    fn widget_list_rides_undo_redo() {
+        use crate::model::Widget;
         let mut doc = Document::new("t", 10, 5);
+        let mut hist = History::new();
+        assert!(doc.widgets.is_empty());
+        // Stamp: cells + one widget entity in a single entry.
+        let mut patch = Layer::new();
+        patch.set(0, 0, cell("x", 1, -1));
+        let before: Vec<Widget> = doc.widgets.clone();
+        doc.widgets.push(Widget {
+            kind: "button".to_string(),
+            rect: Rect::new(0, 0, 6, 1),
+            label: "OK".to_string(),
+            style: String::new(),
+        });
+        assert!(hist.commit_full(&mut doc, 0, &patch, None, Some(before)));
+        assert_eq!(doc.widgets.len(), 1);
+        assert!(doc.cell(0, 0).is_some());
+        // Undo restores cells AND empties the entity list.
+        assert!(hist.undo(&mut doc));
+        assert!(doc.widgets.is_empty());
+        assert_eq!(doc.cell(0, 0), None);
+        // Redo brings both back.
+        assert!(hist.redo(&mut doc));
+        assert_eq!(doc.widgets.len(), 1);
+        assert_eq!(doc.widgets[0].kind, "button");
+        assert!(doc.cell(0, 0).is_some());
+        // Plain cell commits leave widgets_before None (untouched).
+        let mut patch2 = Layer::new();
+        patch2.set(1, 1, cell("y", 2, -1));
+        assert!(hist.commit(&mut doc, &patch2));
+        assert!(hist.undo(&mut doc));
+        assert_eq!(doc.widgets.len(), 1, "cell undo keeps entities");
+    }
+
+    #[test]
+    fn new_commit_clears_redo() {        let mut doc = Document::new("t", 10, 5);
         let mut hist = History::new();
         let mut p1 = Layer::new();
         p1.set(0, 0, cell("a", 1, -1));

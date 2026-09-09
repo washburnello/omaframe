@@ -20,7 +20,7 @@ use std::time::SystemTime;
 
 use omaframe::chars;
 use omaframe::draw;
-use omaframe::model::{Cell, Document, History, Layer, PaintColor, Rect};
+use omaframe::model::{Cell, Document, History, Layer, PaintColor, Rect, Widget};
 use unicode_width::UnicodeWidthStr;
 
 /// Cycle light → heavy → double → rounded → ascii (`L` key).
@@ -206,6 +206,133 @@ pub fn palette_chars(tab: usize) -> Vec<String> {
         .map(|s| s.to_string())
         .collect(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Selection handles + select-tool drags (Phase 3)
+// ---------------------------------------------------------------------------
+
+/// Selection handle positions: corners + edge midpoints.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Handle {
+    NW,
+    N,
+    NE,
+    E,
+    SE,
+    S,
+    SW,
+    W,
+}
+
+impl Handle {
+    pub fn is_corner(self) -> bool {
+        matches!(
+            self,
+            Handle::NW | Handle::NE | Handle::SE | Handle::SW
+        )
+    }
+
+    /// Cell of this handle within `r` (`None` for empty rects). Degenerate
+    /// rects merge handles: 1-wide rects collapse E/W into the corners and
+    /// N/S onto the column; 1-tall likewise. Callers should dedupe.
+    pub fn pos(self, r: &Rect) -> Option<(i32, i32)> {
+        if r.w == 0 || r.h == 0 {
+            return None;
+        }
+        let (x0, y0) = (r.x, r.y);
+        let (x1, y1) = (r.x + r.w as i32 - 1, r.y + r.h as i32 - 1);
+        let mx = r.x + r.w as i32 / 2;
+        let my = r.y + r.h as i32 / 2;
+        Some(match self {
+            Handle::NW => (x0, y0),
+            Handle::N => (mx, y0),
+            Handle::NE => (x1, y0),
+            Handle::E => (x1, my),
+            Handle::SE => (x1, y1),
+            Handle::S => (mx, y1),
+            Handle::SW => (x0, y1),
+            Handle::W => (x0, my),
+        })
+    }
+
+    /// All handle positions for `r`, deduped (corners first).
+    pub fn all(r: &Rect) -> Vec<(Handle, (i32, i32))> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for h in [
+            Handle::NW,
+            Handle::NE,
+            Handle::SE,
+            Handle::SW,
+            Handle::N,
+            Handle::E,
+            Handle::S,
+            Handle::W,
+        ] {
+            if let Some(p) = h.pos(r) {
+                if seen.insert(p) {
+                    out.push((h, p));
+                }
+            }
+        }
+        out
+    }
+
+    /// Handle occupying doc cell `(x, y)` in `r`, if any.
+    pub fn at(r: &Rect, x: i32, y: i32) -> Option<Handle> {
+        Self::all(r)
+            .into_iter()
+            .find(|(_, p)| *p == (x, y))
+            .map(|(h, _)| h)
+    }
+
+    /// Opposite corner (for rubber-adjust drags started on a handle).
+    pub fn opposite_corner(self, r: &Rect) -> (i32, i32) {
+        let (x0, y0) = (r.x, r.y);
+        let (x1, y1) = (r.x + r.w as i32 - 1, r.y + r.h as i32 - 1);
+        match self {
+            Handle::NW => (x1, y1),
+            Handle::N => (x1, y1),
+            Handle::NE => (x0, y1),
+            Handle::E => (x0, y1),
+            Handle::SE => (x0, y0),
+            Handle::S => (x0, y0),
+            Handle::SW => (x1, y0),
+            Handle::W => (x1, y0),
+        }
+    }
+}
+
+/// In-progress select-tool drag (Phase 3). Rubber-band uses the legacy
+/// anchor/drawing flow with `select_drag == None`.
+#[derive(Clone, Debug)]
+pub enum SelectDrag {
+    /// Block move: `origin` rect on the active layer, grab offset from the
+    /// press point to the origin top-left, `moved` once the cursor leaves
+    /// the press cell. `widget` is the moved entity, if any.
+    Move {
+        origin: Rect,
+        grab_dx: i32,
+        grab_dy: i32,
+        moved: bool,
+        widget: Option<usize>,
+    },
+    /// Widget corner resize: fixed `start` rect, dragged corner.
+    ResizeWidget {
+        idx: usize,
+        corner: Handle,
+        start: Rect,
+    },
+    /// Line-tip reshape: `tip` follows the cursor, redrawn from `anchor`.
+    Tip {
+        tip: (i32, i32),
+        anchor: (i32, i32),
+    },
+    /// Widget stamp placement of `kind`.
+    Stamp {
+        kind: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -670,6 +797,16 @@ pub struct App {
     drawing: bool,
     text_start: Option<(i32, i32)>,
     pan_anchor: Option<(u16, u16, (i32, i32))>,
+    /// Armed widget kind from the Widgets tab (next canvas drag stamps it;
+    /// Shift keeps it armed for repeats).
+    pub pending_widget: Option<String>,
+    /// Widget entity backing the live selection, if any.
+    pub selected_widget: Option<usize>,
+    /// In-progress select/stamp drag (rubber-band uses anchor + None).
+    select_drag: Option<SelectDrag>,
+    /// Live selection captured at press time (move-begin detection +
+    /// opposite-corner rubber adjust).
+    sel_at_press: Option<Rect>,
 }
 
 impl App {
@@ -708,6 +845,10 @@ impl App {
             drawing: false,
             text_start: None,
             pan_anchor: None,
+            pending_widget: None,
+            selected_widget: None,
+            select_drag: None,
+            sel_at_press: None,
         }
     }
 
@@ -1004,6 +1145,11 @@ impl App {
         if self.tool == Tool::Select && t != Tool::Select {
             self.history.clear_selection();
         }
+        // Phase 3 gestures never survive a tool switch.
+        self.select_drag = None;
+        self.sel_at_press = None;
+        self.selected_widget = None;
+        self.pending_widget = None;
         self.tool = t;
         self.set_status(format!("tool: {}", t.label()));
     }
@@ -1481,6 +1627,32 @@ impl App {
         }
     }
 
+    /// Square constraint around a fixed corner: expand the shorter axis.
+    fn square_from_corner(
+        start: &Rect,
+        corner: Handle,
+        cur: (i32, i32),
+    ) -> (i32, i32) {
+        let (fx, fy) = corner.opposite_corner(start);
+        let (nx, ny) = Self::constrain_square_anchor((fx, fy), cur);
+        (nx, ny)
+    }
+
+    /// Normalize a widget resize rect: at least 1×1; single-row kinds
+    /// (template height 1) stay 1 tall so handles cannot stretch text rows.
+    fn normalize_widget_rect(idx: usize, doc: &Document, r: Rect) -> Rect {
+        let single_row = doc
+            .widgets
+            .get(idx)
+            .and_then(|w| omaframe::widgets::spec(&w.kind))
+            .is_some_and(|s| s.default_h <= 1);
+        let (w, mut h) = (r.w.max(1), r.h.max(1));
+        if single_row {
+            h = 1;
+        }
+        Rect::new(r.x, r.y, w, h)
+    }
+
     fn resolve_guard(&self, x: i32, y: i32) -> (i32, i32) {
         if x > 0 && self.doc.is_continuation(x, y) {
             (x - 1, y)
@@ -1529,6 +1701,185 @@ impl App {
 
     // --- gestures ---
 
+    // --- Phase 3: widgets + selection handles ---
+
+    /// Topmost widget entity containing `(x, y)`, if any.
+    pub fn widget_at(&self, x: i32, y: i32) -> Option<usize> {
+        self.doc
+            .widgets
+            .iter()
+            .rposition(|w| {
+                x >= w.rect.x
+                    && y >= w.rect.y
+                    && x < w.rect.x + w.rect.w as i32
+                    && y < w.rect.y + w.rect.h as i32
+            })
+    }
+
+    /// The selected widget, when the live selection is exactly its rect.
+    fn selected_widget_for(&self, sel: &Rect) -> Option<usize> {
+        self.selected_widget.filter(|idx| {
+            self.doc
+                .widgets
+                .get(*idx)
+                .is_some_and(|w| w.rect == *sel)
+        })
+    }
+
+    /// Arm a widget kind from the Widgets tab: the next canvas drag stamps
+    /// it (click = default size). Shift keeps it armed for repeats.
+    pub fn arm_widget(&mut self, kind: &str) {
+        if omaframe::widgets::spec(kind).is_none() {
+            return;
+        }
+        self.pending_widget = Some(kind.to_string());
+        self.set_status(format!(
+            "widget '{kind}': drag on canvas to stamp (Shift keeps it armed)"
+        ));
+    }
+
+    /// Begin a widget stamp drag at a document cell. `keep_armed` (Shift)
+    /// leaves the kind armed for another stamp.
+    pub fn start_stamp(&mut self, x: i32, y: i32, keep_armed: bool) {
+        let Some(kind) = self.pending_widget.clone() else {
+            return;
+        };
+        if !keep_armed {
+            self.pending_widget = None;
+        }
+        let (x, y) = self.resolve_guard(x, y);
+        self.cursor = (x, y);
+        self.clamp_cursor();
+        self.anchor = Some((x, y));
+        self.drawing = true;
+        self.scratch.clear();
+        self.select_drag = Some(SelectDrag::Stamp { kind });
+        self.history.clear_selection();
+        self.selected_widget = None;
+        self.update_stamp(x, y);
+    }
+
+    /// Rebuild the stamp preview for `kind` over the anchor→cursor rect.
+    /// Clicks (1×1) fall back to the catalog default size.
+    fn update_stamp(&mut self, x: i32, y: i32) {
+        let Some(SelectDrag::Stamp { kind }) = self.select_drag.clone() else {
+            return;
+        };
+        let Some(a) = self.anchor else { return };
+        self.cursor = (x, y);
+        let mut r = Rect::from_points(a.0, a.1, x, y);
+        if r.w <= 1 && r.h <= 1 {
+            if let Some(spec) = omaframe::widgets::spec(&kind) {
+                r = Rect::new(a.0, a.1, spec.default_w, spec.default_h);
+            }
+        }
+        self.scratch = self.bake_widget_layer(&kind, &r);
+    }
+
+    /// Bake `kind` into a scratch layer over `r` with the current pots.
+    fn bake_widget_layer(&self, kind: &str, r: &Rect) -> Layer {
+        let spec = match omaframe::widgets::spec(kind) {
+            Some(s) => s,
+            None => return Layer::new(),
+        };
+        let style = spec.styles.first().cloned().unwrap_or_default();
+        let baked = omaframe::widgets::bake(
+            kind,
+            r.w,
+            r.h,
+            &spec.label,
+            &style,
+            self.fg.clone(),
+            self.bg.clone(),
+        )
+        .unwrap_or_default();
+        let mut layer = Layer::new();
+        for ((dx, dy), cell) in baked {
+            layer.set(r.x + dx, r.y + dy, cell);
+        }
+        layer
+    }
+
+    /// Preview layer for resizing widget `idx` to `r` (own colors, never
+    /// the pots — resize must not recolor).
+    fn bake_widget_preview(&self, idx: usize, r: &Rect) -> Layer {
+        let (kind, label, style, fg, bg) = match self.doc.widgets.get(idx) {
+            Some(w) => {
+                let (fg, bg) = self.widget_colors(idx);
+                (w.kind.clone(), w.label.clone(), w.style.clone(), fg, bg)
+            }
+            None => return Layer::new(),
+        };
+        let baked =
+            omaframe::widgets::bake(&kind, r.w, r.h, &label, &style, fg, bg)
+                .unwrap_or_default();
+        let mut layer = Layer::new();
+        for ((dx, dy), cell) in baked {
+            layer.set(r.x + dx, r.y + dy, cell);
+        }
+        layer
+    }
+
+    /// Commit a finished stamp: one undo entry for cells + widget entity.
+    fn commit_stamp(&mut self, kind: String, r: Rect) {
+        let widgets_before = Some(self.doc.widgets.clone());
+        let patch = self.bake_widget_layer(&kind, &r);
+        let spec = omaframe::widgets::spec(&kind);
+        let (label, style) = match spec {
+            Some(s) => (
+                s.label.clone(),
+                s.styles.first().cloned().unwrap_or_default(),
+            ),
+            None => (String::new(), String::new()),
+        };
+        let rect = Rect::new(r.x, r.y, r.w.max(1), r.h.max(1));
+        self.doc.widgets.push(Widget {
+            kind: kind.clone(),
+            rect,
+            label,
+            style,
+        });
+        let idx = self.doc.widgets.len() - 1;
+        let layer_idx = self.doc.active;
+        if self
+            .history
+            .commit_full(&mut self.doc, layer_idx, &patch, None, widgets_before)
+        {
+            self.dirty = true;
+        }
+        self.history.set_selection(Some(rect));
+        self.selected_widget = Some(idx);
+        self.set_status(format!("stamped {kind} {}x{}", rect.w, rect.h));
+    }
+
+    /// Non-transparent active-layer cells of the widget's current bake
+    /// (used to erase exactly the widget on move/resize, never neighbours).
+    fn widget_baked_cells(&self, idx: usize) -> Vec<((i32, i32), Cell)> {
+        let Some(w) = self.doc.widgets.get(idx) else {
+            return Vec::new();
+        };
+        let layer = self.doc.active_layer();
+        let mut out = Vec::new();
+        for y in w.rect.y..w.rect.y + w.rect.h as i32 {
+            for x in w.rect.x..w.rect.x + w.rect.w as i32 {
+                if let Some(c) = layer.get(x, y) {
+                    out.push(((x, y), c));
+                }
+            }
+        }
+        out
+    }
+
+    /// Colors for re-baking widget `idx`: first baked cell's pots, else the
+    /// current pots.
+    fn widget_colors(&self, idx: usize) -> (PaintColor, Option<PaintColor>) {
+        if let Some((_, c)) = self.widget_baked_cells(idx).into_iter().next() {
+            (c.fg, c.bg)
+        } else {
+            (self.fg.clone(), self.bg.clone())
+        }
+    }
+
     /// Begin a left-drag gesture at a document cell.
     pub fn start_stroke(&mut self, x: i32, y: i32, _shift: bool) {
         let (x, y) = self.resolve_guard(x, y);
@@ -1547,6 +1898,87 @@ impl App {
                 self.set_status("text: type, Enter commits, Esc commits, Shift+Enter newline");
             }
             Tool::Select => {
+                // Phase 3 dispatch order: handle → tip → inside-selection
+                // move → widget select → rubber-band.
+                self.sel_at_press = self.history.selection();
+                self.selected_widget = self
+                    .sel_at_press
+                    .as_ref()
+                    .and_then(|r| self.selected_widget_for(r));
+                if let Some(sel) = self.sel_at_press {
+                    // Corner handle on a widget: resize drag. Other
+                    // handles: rubber-adjust from the opposite corner.
+                    if let Some(h) = Handle::at(&sel, x, y) {
+                        if h.is_corner() {
+                            if let Some(idx) = self.selected_widget {
+                                self.anchor = Some((x, y));
+                                self.drawing = true;
+                                self.scratch.clear();
+                                let start = self.doc.widgets[idx].rect;
+                                self.select_drag = Some(SelectDrag::ResizeWidget {
+                                    idx,
+                                    corner: h,
+                                    start,
+                                });
+                                self.set_status("resize: drag a corner");
+                                return;
+                            }
+                        }
+                        let opp = h.opposite_corner(&sel);
+                        self.anchor = Some(opp);
+                        self.drawing = true;
+                        self.scratch.clear();
+                        self.selected_widget = None;
+                        return;
+                    }
+                    // Inside the live selection: pending move (confirmed
+                    // once the cursor leaves the press cell).
+                    if sel.contains(x, y) {
+                        let widget = self.selected_widget;
+                        self.anchor = Some((x, y));
+                        self.drawing = true;
+                        self.scratch.clear();
+                        self.select_drag = Some(SelectDrag::Move {
+                            origin: sel,
+                            grab_dx: x - sel.x,
+                            grab_dy: y - sel.y,
+                            moved: false,
+                            widget,
+                        });
+                        return;
+                    }
+                }
+                // Line endpoint: tip-reshape drag from its neighbour.
+                let layer_idx = self.doc.active;
+                if let Some((tip, anchor)) =
+                    draw::line_endpoint(&self.doc, layer_idx, x, y)
+                {
+                    self.anchor = Some((x, y));
+                    self.drawing = true;
+                    self.scratch.clear();
+                    self.select_drag = Some(SelectDrag::Tip { tip, anchor });
+                    self.set_status("line tip: drag to reshape");
+                    return;
+                }
+                // Widget body: select it (a follow-up drag moves it via the
+                // inside-selection path above).
+                if let Some(idx) = self.widget_at(x, y) {
+                    let rect = self.doc.widgets[idx].rect;
+                    self.history.set_selection(Some(rect));
+                    self.selected_widget = Some(idx);
+                    self.sel_at_press = Some(rect);
+                    self.anchor = Some((x, y));
+                    self.drawing = true;
+                    self.scratch.clear();
+                    self.set_status(format!(
+                        "widget '{}' selected: drag to move, corners resize",
+                        self.doc.widgets[idx].kind
+                    ));
+                    return;
+                }
+                // Rubber-band (legacy flow).
+                self.selected_widget = None;
+                self.sel_at_press = None;
                 self.anchor = Some((x, y));
                 self.drawing = true;
                 self.scratch.clear();
@@ -1581,6 +2013,12 @@ impl App {
             return;
         };
         if !self.drawing {
+            return;
+        }
+        // Widget stamps bypass the active tool (armed from the Widgets
+        // tab under any tool).
+        if matches!(self.select_drag, Some(SelectDrag::Stamp { .. })) {
+            self.update_stamp(x, y);
             return;
         }
         match self.tool {
@@ -1667,6 +2105,30 @@ impl App {
                     draw::paint_cells(&draw::rect_cells(r), &self.ch, self.fg.clone(), self.bg.clone());
             }
             Tool::Select => {
+                // Active Phase 3 drag: update its preview.
+                if self.select_drag.is_some() {
+                    self.update_select_drag(x, y, shift);
+                    return;
+                }
+                // Fresh press inside a selection (widget click or
+                // inside-selection press): leaving the press cell begins
+                // a move.
+                if let Some(origin) = self.sel_at_press {
+                    if let Some(a) = self.anchor {
+                        if (x, y) != a && origin.contains(a.0, a.1) {
+                            let widget = self.selected_widget;
+                            self.select_drag = Some(SelectDrag::Move {
+                                origin,
+                                grab_dx: a.0 - origin.x,
+                                grab_dy: a.1 - origin.y,
+                                moved: false,
+                                widget,
+                            });
+                            self.update_select_drag(x, y, shift);
+                            return;
+                        }
+                    }
+                }
                 let r = Rect::from_points(a.0, a.1, x, y);
                 self.history.set_selection(Some(r));
                 self.set_status(format!("select {}x{}", r.w, r.h));
@@ -1675,9 +2137,277 @@ impl App {
         }
     }
 
+    /// Extend the live Phase 3 drag (move / resize / tip / stamp).
+    fn update_select_drag(&mut self, x: i32, y: i32, shift: bool) {
+        let (x, y) = self.resolve_guard(x, y);
+        self.cursor = (x, y);
+        let drag = match self.select_drag.clone() {
+            Some(d) => d,
+            None => return,
+        };
+        match drag {
+            SelectDrag::Move {
+                origin,
+                grab_dx,
+                grab_dy,
+                widget,
+                ..
+            } => {
+                let dx = x - (origin.x + grab_dx);
+                let dy = y - (origin.y + grab_dy);
+                let moved = dx != 0 || dy != 0;
+                self.select_drag = Some(SelectDrag::Move {
+                    origin,
+                    grab_dx,
+                    grab_dy,
+                    moved,
+                    widget,
+                });
+                if !moved {
+                    self.scratch.clear();
+                    return;
+                }
+                // Ghost preview: translated active-layer cells.
+                let layer = self.doc.active_layer();
+                let mut preview = Layer::new();
+                for ((cx, cy), cell) in layer.entries() {
+                    if cell.is_transparent() {
+                        continue;
+                    }
+                    if origin.contains(cx, cy) {
+                        preview.set(cx + dx, cy + dy, cell);
+                    }
+                }
+                self.scratch = preview;
+                self.set_status(format!("move {dx:+},{dy:+} · release to drop"));
+            }
+            SelectDrag::ResizeWidget { idx, corner, start } => {
+                let (fx, fy) = corner.opposite_corner(&start);
+                let (mut nx, mut ny) = (x, y);
+                if shift {
+                    // Square constraint around the fixed corner.
+                    let (sx, sy) = Self::square_from_corner(&start, corner, (x, y));
+                    nx = sx;
+                    ny = sy;
+                }
+                let r = Rect::from_points(fx, fy, nx, ny);
+                let r = Self::normalize_widget_rect(idx, &self.doc, r);
+                self.cursor = (x, y);
+                self.scratch = self.bake_widget_preview(idx, &r);
+                self.set_status(format!("resize {}x{}", r.w, r.h));
+            }
+            SelectDrag::Tip { tip, anchor } => {
+                let mut patch = self.tint(draw::draw_line(
+                    anchor.0,
+                    anchor.1,
+                    x,
+                    y,
+                    false,
+                ));
+                let layer_idx = self.doc.active;
+                draw::snap_patch(&self.doc, layer_idx, &mut patch);
+                self.scratch = patch;
+                let _ = tip;
+                self.set_status("line tip: release to commit");
+            }
+            SelectDrag::Stamp { .. } => {
+                self.update_stamp(x, y);
+            }
+        }
+    }
+
+    /// Release a Phase 3 drag: exactly one undo entry per gesture.
+    fn end_select_drag(&mut self) {
+        let drag = match self.select_drag.take() {
+            Some(d) => d,
+            None => return,
+        };
+        self.scratch.clear();
+        match drag {
+            SelectDrag::Move {
+                origin,
+                grab_dx,
+                grab_dy,
+                moved,
+                widget,
+            } => {
+                if !moved {
+                    // Click without drag: keep the selection.
+                    self.set_status("select: kept");
+                    return;
+                }
+                let dx = self.cursor.0 - (origin.x + grab_dx);
+                let dy = self.cursor.1 - (origin.y + grab_dy);
+                self.commit_move(origin, dx, dy, widget);
+            }
+            SelectDrag::ResizeWidget { idx, corner, start } => {
+                let (fx, fy) = corner.opposite_corner(&start);
+                let r = Rect::from_points(fx, fy, self.cursor.0, self.cursor.1);
+                let r = Self::normalize_widget_rect(idx, &self.doc, r);
+                self.commit_widget_resize(idx, r);
+            }
+            SelectDrag::Tip { tip, anchor } => {
+                let (cx, cy) = (self.cursor.0, self.cursor.1);
+                if (cx, cy) == tip {
+                    self.set_status("line tip: unchanged");
+                    return;
+                }
+                let mut patch = self.tint(draw::draw_line(
+                    anchor.0, anchor.1, cx, cy, false,
+                ));
+                // Erase the stale tip unless the new line covers it.
+                if patch.get(tip.0, tip.1).is_none() {
+                    patch.set(tip.0, tip.1, Cell::erased());
+                }
+                let layer_idx = self.doc.active;
+                draw::snap_patch(&self.doc, layer_idx, &mut patch);
+                if self.history.commit(&mut self.doc, &patch) {
+                    self.dirty = true;
+                }
+                self.history.clear_selection();
+                self.selected_widget = None;
+                self.set_status("line reshaped");
+            }
+            SelectDrag::Stamp { kind } => {
+                let Some(a) = self.anchor else { return };
+                let (cx, cy) = (self.cursor.0, self.cursor.1);
+                let mut r = Rect::from_points(a.0, a.1, cx, cy);
+                if r.w <= 1 && r.h <= 1 {
+                    if let Some(spec) = omaframe::widgets::spec(&kind) {
+                        r = Rect::new(a.0, a.1, spec.default_w, spec.default_h);
+                    }
+                }
+                self.commit_stamp(kind, r);
+            }
+        }
+    }
+
+    /// Commit a block move: erase the origin cells, paint them translated.
+    /// Snapped after the fact so moved boxes reconnect to neighbours.
+    /// Two passes (erase all, then paint all): a translated target can
+    /// overlap another origin cell, and paint must win regardless of
+    /// `HashMap` iteration order.
+    fn commit_move(&mut self, origin: Rect, dx: i32, dy: i32, widget: Option<usize>) {
+        let widgets_before = widget.map(|_| self.doc.widgets.clone());
+        let layer = self.doc.active_layer();
+        let mut moving: Vec<((i32, i32), Cell)> = Vec::new();
+        for ((cx, cy), cell) in layer.entries() {
+            if cell.is_transparent() || !origin.contains(cx, cy) {
+                continue;
+            }
+            moving.push(((cx, cy), cell));
+        }
+        let mut patch = Layer::new();
+        for ((cx, cy), _) in &moving {
+            patch.set(*cx, *cy, Cell::erased());
+        }
+        for ((cx, cy), cell) in &moving {
+            patch.set(cx + dx, cy + dy, cell.clone());
+        }
+        // Widget entities ride along with their cells.
+        if let Some(idx) = widget {
+            if let Some(w) = self.doc.widgets.get_mut(idx) {
+                w.rect.x += dx;
+                w.rect.y += dy;
+            }
+        }
+        let new_sel = Rect::new(origin.x + dx, origin.y + dy, origin.w, origin.h);
+        let layer_idx = self.doc.active;
+        if self.history.commit_full(
+            &mut self.doc,
+            layer_idx,
+            &patch,
+            None,
+            widgets_before,
+        ) {
+            self.dirty = true;
+        }
+        self.history.set_selection(Some(new_sel));
+        self.set_status(format!("moved {dx:+},{dy:+}"));
+    }
+
+    /// Commit a widget corner resize: erase the old bake exactly, bake the
+    /// new rect with the widget's own colors.
+    fn commit_widget_resize(&mut self, idx: usize, r: Rect) {
+        let (kind, label, style, old_rect) = match self.doc.widgets.get(idx) {
+            Some(w) => (
+                w.kind.clone(),
+                w.label.clone(),
+                w.style.clone(),
+                w.rect,
+            ),
+            None => return,
+        };
+        let (fg, bg) = self.widget_colors(idx);
+        let widgets_before = Some(self.doc.widgets.clone());
+        // Erase only cells matching the old bake (never neighbours).
+        let old_bake = omaframe::widgets::bake(
+            &kind,
+            old_rect.w,
+            old_rect.h,
+            &label,
+            &style,
+            fg.clone(),
+            bg.clone(),
+        )
+        .unwrap_or_default();
+        let mut old_set = std::collections::HashSet::new();
+        for ((dx, dy), _) in &old_bake {
+            old_set.insert((old_rect.x + dx, old_rect.y + dy));
+        }
+        let mut patch = Layer::new();
+        {
+            let layer = self.doc.active_layer();
+            for (x, y) in old_set {
+                if let Some(c) = layer.get(x, y) {
+                    // Only erase what the widget itself painted: compare
+                    // against the old bake cell.
+                    let matches = old_bake.iter().any(|((dx, dy), cell)| {
+                        old_rect.x + dx == x && old_rect.y + dy == y && *cell == c
+                    });
+                    if matches {
+                        patch.set(x, y, Cell::erased());
+                    }
+                }
+            }
+        }
+        let new_bake = omaframe::widgets::bake(
+            &kind, r.w, r.h, &label, &style, fg, bg,
+        )
+        .unwrap_or_default();
+        for ((dx, dy), cell) in new_bake {
+            patch.set(r.x + dx, r.y + dy, cell);
+        }
+        if let Some(w) = self.doc.widgets.get_mut(idx) {
+            w.rect = Rect::new(r.x, r.y, r.w.max(1), r.h.max(1));
+        }
+        let layer_idx = self.doc.active;
+        if self.history.commit_full(
+            &mut self.doc,
+            layer_idx,
+            &patch,
+            None,
+            widgets_before,
+        ) {
+            self.dirty = true;
+        }
+        let rect = self.doc.widgets[idx].rect;
+        self.history.set_selection(Some(rect));
+        self.selected_widget = Some(idx);
+        self.set_status(format!("resized {}x{}", rect.w, rect.h));
+    }
+
     /// Release: commit one undo entry (or nothing for no-ops).
     pub fn end_stroke(&mut self) {
         if !self.drawing {
+            return;
+        }
+        // Phase 3 select/stamp drags commit through their own paths.
+        if self.select_drag.is_some() {
+            self.end_select_drag();
+            self.anchor = None;
+            self.drawing = false;
+            self.sel_at_press = None;
             return;
         }
         match self.tool {
@@ -1696,16 +2426,21 @@ impl App {
                 self.drawing = false;
             }
             Tool::Select => {
-                // Click without drag clears; rubber-band keeps the rect and
-                // commits nothing (tools-spec §11).
-                if let Some(a) = self.anchor {
+                // Click without drag clears — unless the press began
+                // inside a selection or on a widget (then it keeps it);
+                // rubber-band keeps the rect and commits nothing.
+                if self.sel_at_press.is_some() {
+                    // kept
+                } else if let Some(a) = self.anchor {
                     if a == self.cursor {
                         self.history.clear_selection();
+                        self.selected_widget = None;
                         self.set_status("select: cleared");
                     }
                 }
                 self.anchor = None;
                 self.drawing = false;
+                self.sel_at_press = None;
             }
             Tool::Text | Tool::Grab | Tool::Pan => {
                 self.anchor = None;
@@ -1715,10 +2450,19 @@ impl App {
     }
 
     /// Esc: cancel a shape gesture, commit pending text (decisions.md),
-    /// else clear the selection.
+    /// else clear drag state / disarm widget / clear the selection.
     pub fn cancel_stroke(&mut self) {
         if self.text_start.is_some() {
             self.commit_text();
+            return;
+        }
+        if self.select_drag.is_some() {
+            self.select_drag = None;
+            self.scratch.clear();
+            self.anchor = None;
+            self.drawing = false;
+            self.sel_at_press = None;
+            self.set_status("cancelled");
             return;
         }
         if self.drawing {
@@ -1728,8 +2472,13 @@ impl App {
             self.set_status("cancelled");
             return;
         }
+        if self.pending_widget.take().is_some() {
+            self.set_status("widget disarmed");
+            return;
+        }
         if self.history.selection().is_some() {
             self.history.clear_selection();
+            self.selected_widget = None;
             self.set_status("select: cleared");
         }
     }
@@ -2576,5 +3325,232 @@ mod tests {
         assert_eq!(app.bg, Some(PaintColor::Rgb(44, 55, 66)));
         assert!(!app.grab_at(70, 20)); // empty: changes nothing
         assert_eq!(app.ch, "Q");
+    }
+
+    // --- Phase 3: handles, stamps, moves, tips, resizes ---
+
+    #[test]
+    fn handle_geometry_corners_and_degenerate() {
+        let r = Rect::new(2, 3, 5, 4);
+        assert_eq!(Handle::at(&r, 2, 3), Some(Handle::NW));
+        assert_eq!(Handle::at(&r, 6, 3), Some(Handle::NE));
+        assert_eq!(Handle::at(&r, 6, 6), Some(Handle::SE));
+        assert_eq!(Handle::at(&r, 2, 6), Some(Handle::SW));
+        assert_eq!(Handle::at(&r, 4, 3), Some(Handle::N));
+        assert_eq!(Handle::at(&r, 6, 5), Some(Handle::E));
+        assert_eq!(Handle::at(&r, 4, 6), Some(Handle::S));
+        assert_eq!(Handle::at(&r, 2, 5), Some(Handle::W));
+        assert_eq!(Handle::at(&r, 4, 4), None, "interior is not a handle");
+        assert_eq!(Handle::at(&r, 0, 0), None, "exterior is not a handle");
+        // Corners win ties in all(); every position maps.
+        assert_eq!(Handle::all(&r).len(), 8);
+        // 1-wide column: edge handles collapse into corners; dedupe keeps
+        // the first listed (SE wins the bottom cell over SW).
+        let col = Rect::new(0, 0, 1, 5);
+        let pts = Handle::all(&col);
+        assert!(pts.len() < 8);
+        assert_eq!(Handle::at(&col, 0, 0), Some(Handle::NW));
+        assert_eq!(Handle::at(&col, 0, 4), Some(Handle::SE));
+        // Empty rect: nothing.
+        assert!(Handle::all(&Rect::new(0, 0, 0, 3)).is_empty());
+        assert!(Handle::NW.is_corner());
+        assert!(!Handle::N.is_corner());
+        // Opposite corners anchor rubber-adjust drags.
+        assert_eq!(Handle::NW.opposite_corner(&r), (6, 6));
+        assert_eq!(Handle::SE.opposite_corner(&r), (2, 3));
+    }
+
+    #[test]
+    fn stamp_places_widget_in_one_undo_entry() {
+        let mut app = App::new(test_doc(), None);
+        app.set_tool(Tool::Select);
+        app.arm_widget("button");
+        assert_eq!(app.pending_widget, Some("button".to_string()));
+        // Drag-out rect 0,0 → 11,0 (12 wide).
+        app.start_stamp(0, 0, false);
+        assert!(app.pending_widget.is_none(), "disarmed after stamp");
+        app.update_stroke(11, 0, false);
+        let before = app.history.undo_len();
+        app.end_stroke();
+        assert_eq!(app.history.undo_len(), before + 1, "single entry");
+        assert_eq!(app.doc.widgets.len(), 1);
+        let w = &app.doc.widgets[0];
+        assert_eq!(w.kind, "button");
+        assert_eq!((w.rect.x, w.rect.y, w.rect.w), (0, 0, 12));
+        // Baked cells exist on the active layer.
+        assert!(app.doc.cell(0, 0).is_some());
+        assert_eq!(app.doc.cell(0, 0).unwrap().ch, "[");
+        // Selection follows the widget; widget is selected.
+        assert_eq!(app.history.selection(), Some(w.rect));
+        assert_eq!(app.selected_widget, Some(0));
+        // Click (no drag) falls back to the default size.
+        let mut app2 = App::new(test_doc(), None);
+        app2.arm_widget("checkbox");
+        app2.start_stamp(5, 5, false);
+        app2.end_stroke();
+        assert_eq!(app2.doc.widgets.len(), 1);
+        assert_eq!(
+            (app2.doc.widgets[0].rect.w, app2.doc.widgets[0].rect.h),
+            (9, 1)
+        );
+        // Shift keeps the kind armed for repeats.
+        let mut app3 = App::new(test_doc(), None);
+        app3.arm_widget("close");
+        app3.start_stamp(0, 0, true);
+        app3.end_stroke();
+        assert_eq!(app3.pending_widget, Some("close".to_string()));
+        // Stamps work under any active tool (Pencil here, not Select).
+        let mut app4 = App::new(test_doc(), None);
+        app4.set_tool(Tool::Pencil);
+        app4.arm_widget("close");
+        app4.start_stamp(0, 0, false);
+        app4.update_stroke(2, 0, false);
+        app4.end_stroke();
+        assert_eq!(app4.doc.widgets.len(), 1);
+        assert_eq!(app4.doc.widgets[0].kind, "close");
+        // Undo removes cells AND the entity together.
+        app.undo();
+        assert!(app.doc.widgets.is_empty());
+        assert_eq!(app.doc.cell(0, 0), None);
+        app.redo();
+        assert_eq!(app.doc.widgets.len(), 1);
+        assert!(app.doc.cell(0, 0).is_some());
+    }
+
+    #[test]
+    fn select_moves_plain_blocks_in_one_entry() {
+        let mut app = App::new(test_doc(), None);
+        // Paint two cells, rubber-band them, drag the body +1,+1.
+        app.set_tool(Tool::Pencil);
+        app.ch = "x".to_string();
+        app.start_stroke(2, 2, false);
+        app.end_stroke();
+        app.start_stroke(3, 3, false);
+        app.end_stroke();
+        app.set_tool(Tool::Select);
+        app.start_stroke(1, 1, false);
+        app.update_stroke(4, 4, false);
+        app.end_stroke();
+        let sel = app.history.selection().expect("rubber selection");
+        assert_eq!((sel.x, sel.y, sel.w, sel.h), (1, 1, 4, 4));
+        let undo_before = app.history.undo_len();
+        // Press inside (not on a handle — (3,2) is interior, not a handle
+        // of the 1,1+4x4 rect whose handles sit on the border).
+        app.start_stroke(3, 2, false);
+        app.update_stroke(4, 3, false);
+        app.end_stroke();
+        assert_eq!(app.history.undo_len(), undo_before + 1, "single entry");
+        // Cells relocated +1,+1; origin erased.
+        assert!(app.doc.cell(3, 3).is_some());
+        assert!(app.doc.cell(4, 4).is_some());
+        assert_eq!(app.doc.cell(2, 2), None);
+        // Selection followed the move.
+        assert_eq!(
+            app.history.selection(),
+            Some(Rect::new(2, 2, 4, 4))
+        );
+        app.undo();
+        assert!(app.doc.cell(2, 2).is_some(), "undo restores origin");
+        assert_eq!(app.doc.cell(4, 4), None, "undo removes the move");
+        assert!(app.doc.cell(3, 3).is_some(), "(3,3) was occupied pre-move");
+    }
+
+    #[test]
+    fn select_click_without_drag_keeps_selection() {
+        let mut app = App::new(test_doc(), None);
+        app.set_tool(Tool::Select);
+        app.start_stroke(0, 0, false);
+        app.update_stroke(5, 5, false);
+        app.end_stroke();
+        assert!(app.history.selection().is_some());
+        let undo_before = app.history.undo_len();
+        // Click inside without moving: no new entry, selection kept.
+        app.start_stroke(2, 2, false);
+        app.end_stroke();
+        assert_eq!(app.history.undo_len(), undo_before);
+        assert!(app.history.selection().is_some());
+        // Click outside clears (legacy rubber behavior).
+        app.start_stroke(50, 50, false);
+        app.end_stroke();
+        assert_eq!(app.history.selection(), None);
+    }
+
+    #[test]
+    fn tip_drag_reshapes_line_endpoints() {
+        let mut app = App::new(test_doc(), None);
+        // Horizontal line (0,0)→(4,0) on the active layer.
+        app.set_tool(Tool::Line);
+        app.start_stroke(0, 0, false);
+        app.update_stroke(4, 0, false);
+        app.end_stroke();
+        assert_eq!(app.doc.cell(4, 0).unwrap().ch, "─");
+        // Grab the (4,0) tip and drag it down to (4,3).
+        app.set_tool(Tool::Select);
+        app.start_stroke(4, 0, false);
+        app.update_stroke(4, 3, false);
+        let undo_before = app.history.undo_len();
+        app.end_stroke();
+        assert_eq!(app.history.undo_len(), undo_before + 1, "single entry");
+        // Old tip erased, new leg present with a corner at the anchor.
+        assert_eq!(app.doc.cell(4, 0), None, "stale tip erased");
+        assert!(app.doc.cell(4, 3).is_some(), "new tip painted");
+        assert!(app.doc.cell(3, 0).is_some(), "old run kept");
+        app.undo();
+        assert_eq!(app.doc.cell(4, 0).unwrap().ch, "─", "undo restores");
+        assert_eq!(app.doc.cell(4, 3), None);
+    }
+
+    #[test]
+    fn widget_resize_rebakes_and_moves_track_rect() {
+        let mut app = App::new(test_doc(), None);
+        app.set_tool(Tool::Select);
+        app.arm_widget("button");
+        app.start_stamp(0, 0, false);
+        app.update_stroke(7, 0, false);
+        app.end_stroke();
+        assert_eq!(app.selected_widget, Some(0));
+        // Corner drag SE: 8-wide → 12-wide.
+        let r = app.doc.widgets[0].rect;
+        app.start_stroke(r.x + r.w as i32 - 1, r.y + r.h as i32 - 1, false);
+        app.update_stroke(11, 0, false);
+        let undo_before = app.history.undo_len();
+        app.end_stroke();
+        assert_eq!(app.history.undo_len(), undo_before + 1, "single entry");
+        assert_eq!(app.doc.widgets[0].rect.w, 12);
+        // Body drag moves cells + entity together.
+        let r = app.doc.widgets[0].rect;
+        app.start_stroke(r.x + 2, r.y, false);
+        app.update_stroke(r.x + 4, r.y + 2, false);
+        app.end_stroke();
+        assert_eq!(app.doc.widgets[0].rect.x, r.x + 2);
+        assert_eq!(app.doc.widgets[0].rect.y, r.y + 2);
+        assert_eq!(app.history.selection(), Some(app.doc.widgets[0].rect));
+        app.undo();
+        assert_eq!(app.doc.widgets[0].rect, r, "undo restores rect");
+    }
+
+    #[test]
+    fn widget_click_selects_and_tool_switch_clears_phase3() {
+        let mut app = App::new(test_doc(), None);
+        app.set_tool(Tool::Select);
+        app.arm_widget("close");
+        app.start_stamp(10, 10, false);
+        app.end_stroke();
+        // Click the widget body: selects it.
+        app.history.clear_selection();
+        app.selected_widget = None;
+        app.start_stroke(11, 10, false);
+        app.end_stroke();
+        assert_eq!(app.selected_widget, Some(0));
+        assert_eq!(app.history.selection(), Some(app.doc.widgets[0].rect));
+        // Switching tools clears gesture state.
+        app.set_tool(Tool::Pencil);
+        assert_eq!(app.history.selection(), None);
+        assert_eq!(app.selected_widget, None);
+        assert_eq!(app.pending_widget, None);
+        // Esc disarms a pending widget.
+        app.arm_widget("close");
+        app.cancel_stroke();
+        assert_eq!(app.pending_widget, None);
     }
 }

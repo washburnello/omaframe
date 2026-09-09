@@ -8,3 +8,4 @@ pub mod draw;
 pub mod theme;
 pub mod clipboard;
 pub mod chars;
+pub mod widgets;

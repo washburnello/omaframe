@@ -347,9 +347,12 @@ The skill reads/writes the same schema as the app — no parallel format.
 - **Phase 2 — Paint core**: pencil, fg/bg pots (L=fg/R=bg), eyedropper,
   Palette tabs (Letters/Numbers/Symbols/Outlines/Blocks) + sort order,
   shift-snap. Acceptance: paint with any char + colors, eyedropper round-trip.
-- **Phase 3 — Shapes + handles**: rounded-rect, oval/circle, widget stamps v1
-  + corner/tip handles on everything. Acceptance: draw/resize/move each shape
-  and one button + one panel.
+- **Phase 3 — Shapes + handles** ✅ SHIPPED (Wave 11): rounded-rect,
+  oval/circle, widget stamps v1 (12 parametric kinds from
+  `assets/widgets.toml`, re-baking resize) + 8 selection handles
+  (corners resize widgets, else rubber-adjust) + block move + line-tip
+  reshape, all single-entry undo. Deferred: box attach reflow, full
+  cellContext heuristic.
 - **Phase 4 — Layers + glyphs**: multi-layer compose + transparency, Nerds tab
   (~100) + font test page + missing-glyph banner. Acceptance: bg wireframe +
   text overlay composes; test page renders.

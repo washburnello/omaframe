@@ -13,7 +13,8 @@ use ratatui::{
 };
 
 use crate::app::{
-    App, DialogPurpose, DirEntry, FileDialog, GLYPH_CATEGORIES, PALETTE_TABS, Tool, fs_glyphs,
+    App, DialogPurpose, DirEntry, FileDialog, GLYPH_CATEGORIES, Handle, PALETTE_TABS, Tool,
+    fs_glyphs,
 };
 use omaframe::model::{self, PaintColor};
 use omaframe::theme;
@@ -979,6 +980,16 @@ fn render_canvas(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme
     let empty_style = theme::cell_style(PaintColor::Ansi(7), None, t, app.preview_dark);
     let cursor_style = Style::default().bg(t.highlight).fg(t.bg).add_modifier(Modifier::BOLD);
     let sel = app.history.selection();
+    // Phase 3 handle cells (corners + edge midpoints of the live
+    // selection) render distinct from the selection body.
+    let handles: std::collections::HashSet<(i32, i32)> = sel
+        .map(|r| {
+            Handle::all(&r)
+                .into_iter()
+                .map(|(_, p)| p)
+                .collect()
+        })
+        .unwrap_or_default();
     let mut lines: Vec<Line> = Vec::with_capacity(ch as usize);
     for dy in 0..ch {
         let doc_y = app.viewport.1 + dy;
@@ -1012,7 +1023,12 @@ fn render_canvas(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme
             } else if in_sel || erased_preview {
                 // Rubber-band selections (select tool, eraser rect) render
                 // inverted: swap fg/bg at the terminal level, glyph kept.
+                // Handle cells add BOLD + the accent color so the 8 drag
+                // points read distinct from the selection body.
                 st = st.add_modifier(Modifier::REVERSED);
+                if in_sel && handles.contains(&(doc_x, doc_y)) {
+                    st = st.fg(t.accent).add_modifier(Modifier::BOLD);
+                }
             }
             spans.push(Span::styled(glyph, st));
         }
@@ -1899,6 +1915,42 @@ mod tests {
         assert!(buf[(sx, sy)].modifier.contains(Modifier::REVERSED));
         let (ox, oy) = screen_of(0, 0);
         assert!(!buf[(ox, oy)].modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn selection_handles_render_distinct_and_hit_map() {
+        use crate::app::Handle;
+        let (mut app, t) = harness();
+        app.set_tool(Tool::Select);
+        app.start_stroke(2, 1, false);
+        app.update_stroke(6, 4, false);
+        app.end_stroke();
+        let sel = app.history.selection().expect("selection");
+        // Handle cells carry REVERSED + BOLD + accent fg; body cells
+        // carry REVERSED without BOLD.
+        let buf = render_to_buf(&mut app, &t);
+        let (hx, hy) = screen_of(sel.x, sel.y); // NW corner
+        let hcell = &buf[(hx, hy)];
+        assert!(hcell.modifier.contains(Modifier::REVERSED));
+        assert!(hcell.modifier.contains(Modifier::BOLD), "handle bold: {hcell:?}");
+        assert_eq!(hcell.fg, t.accent, "handle accent: {hcell:?}");
+        let (bx, by) = screen_of(sel.x + 1, sel.y + 1); // body
+        let bcell = &buf[(bx, by)];
+        assert!(bcell.modifier.contains(Modifier::REVERSED));
+        assert!(!bcell.modifier.contains(Modifier::BOLD));
+        // Screen mapping round-trips through hit_canvas + Handle::at.
+        let areas = compute_layout(
+            ratatui::layout::Rect::new(0, 0, 80, 24),
+            app.doc.layers.len(),
+            app.palette_tab,
+        );
+        let (cx, cy) = screen_of(sel.x + sel.w as i32 - 1, sel.y);
+        let pos = hit_canvas(&areas, &app, cx, cy).expect("on canvas");
+        assert_eq!(
+            Handle::at(&sel, pos.0, pos.1),
+            Some(Handle::NE),
+            "screen corner maps to NE handle"
+        );
     }
 
     fn screen_text(buf: &ratatui::buffer::Buffer) -> String {

@@ -250,3 +250,34 @@ use the palette char; (3) highlighting not working.
 - `cargo clippy --all-targets`: 3 warnings, all fixed by manager (useless
   conversion + 2× clone_on_copy in src/model.rs). Tree is clippy-clean.
 - `cargo build`: warning-free.
+
+## Wave 11: Phase 3 — handles + widget stamps
+
+Select tool grows from rubber-band-only to a full handle system; the
+Widgets tab works (no more "coming in Phase 3").
+
+- **Handles**: live selections render 8 drag points (corners + edge
+  midpoints, REVERSED|BOLD + accent over the inverted body). Corners on a
+  widget resize it; all other handles rubber-adjust from the opposite
+  corner; body drags move.
+- **Widget stamps** (`src/widgets.rs`): `assets/widgets.toml` parsed with
+  a purpose-built reader into specs; click a Widgets-tab name to arm,
+  drag on canvas to place (click = default size, Shift re-arms). Bakes
+  are parametric — panels rebuild borders, scrollbars scale tracks,
+  progress recomputes fill, dividers repeat, 1-row widgets extend rule
+  runs. Entities live in `doc.widgets[]` (already in the schema/golden
+  format); every stamp/move/resize is ONE undo entry via
+  `History::commit_full` (`widgets_before` snapshot swap in undo/redo).
+- **Moves**: rubber/widget bodies drag with a ghost preview and commit
+  erase+paint as one entry. Fixed a real order-dependence bug found by a
+  flaky test: erase-all-then-paint-all two-pass so overlapping
+  origin/target cells resolve deterministically regardless of HashMap
+  order (was ~65% fail rate, now 8/8 + 3 full suites stable).
+- **Line tips**: endpoint clicks (exactly-one-mutual-connection light
+  cells via `draw::line_endpoint`) reshape from the fixed neighbour with
+  snapping; stale tip erased on commit.
+- **Scope notes**: stamps work under any tool; resize never recolors
+  (re-bakes in the widget's own pots); widgets never snap; box attach
+  reflow and full cellContext axis heuristic remain deferred; move/tip
+  previews ghost the old position until release (single-commit tradeoff).
+- QA: 98 tests (50 lib + 42 bin + 6 CLI), clippy clean, golden intact.
