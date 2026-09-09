@@ -592,7 +592,7 @@ impl App {
             scratch: Layer::new(),
             tool: Tool::Pencil,
             ch: "─".to_string(),
-            fg: PaintColor::Ansi(7),
+            fg: PaintColor::Theme("foreground".to_string()),
             bg: None,
             box_style: draw::BoxStyle::Light,
             arrow: false,
@@ -641,17 +641,19 @@ impl App {
     }
 
     pub fn fg_label(&self) -> String {
-        match self.fg {
+        match &self.fg {
             PaintColor::Ansi(i) => i.to_string(),
+            PaintColor::Theme(name) => name.clone(),
             rgb => rgb.to_hex(),
         }
     }
 
     /// Background pot label for the status bar (`None` → `"-"`).
     pub fn bg_label(&self) -> String {
-        match self.bg {
+        match &self.bg {
             None => "-".to_string(),
             Some(PaintColor::Ansi(i)) => i.to_string(),
+            Some(PaintColor::Theme(name)) => name.clone(),
             Some(rgb) => rgb.to_hex(),
         }
     }
@@ -775,12 +777,12 @@ impl App {
         });
     }
 
-    /// Cycle the foreground pot through ANSI slots 0–15 (a truecolor pot
+    /// Cycle the foreground pot through ANSI slots 0–15 (a non-slot pot
     /// resets into the ANSI cycle at 0).
     pub fn cycle_fg(&mut self) {
         let next = match self.fg {
             PaintColor::Ansi(i) => (i + 1) % 16,
-            PaintColor::Rgb(..) => 0,
+            _ => 0,
         };
         self.fg = PaintColor::Ansi(next);
         self.set_status(format!("fg: {}", self.fg_label()));
@@ -793,7 +795,7 @@ impl App {
             None => Some(PaintColor::Ansi(0)),
             Some(PaintColor::Ansi(i)) if i >= 15 => None,
             Some(PaintColor::Ansi(i)) => Some(PaintColor::Ansi(i + 1)),
-            Some(PaintColor::Rgb(..)) => None,
+            _ => None,
         };
         self.set_status(format!("bg: {}", self.bg_label()));
     }
@@ -1215,7 +1217,7 @@ impl App {
             if c.is_transparent() {
                 tinted.set(x, y, Cell::erased());
             } else {
-                tinted.set(x, y, Cell::new(c.ch, self.fg, self.bg));
+                tinted.set(x, y, Cell::new(c.ch, self.fg.clone(), self.bg.clone()));
             }
         }
         tinted
@@ -1297,7 +1299,7 @@ impl App {
         }
         match self.tool {
             Tool::Pencil => {
-                let dab = draw::paint_cells(&[(x, y)], &self.ch, self.fg, self.bg);
+                let dab = draw::paint_cells(&[(x, y)], &self.ch, self.fg.clone(), self.bg.clone());
                 self.scratch.set_from(&dab);
             }
             Tool::Eraser => {
@@ -1348,7 +1350,7 @@ impl App {
                 let mut patch = self.tint(draw::draw_line(a.0, a.1, c.0, c.1, horizontal_first));
                 if self.arrow {
                     let head = Self::arrowhead_for(a.0, a.1, c.0, c.1, horizontal_first);
-                    patch.set(c.0, c.1, Cell::new(head, self.fg, self.bg));
+                    patch.set(c.0, c.1, Cell::new(head, self.fg.clone(), self.bg.clone()));
                 }
                 let idx = self.doc.active;
                 draw::snap_patch(&self.doc, idx, &mut patch);
@@ -1364,7 +1366,7 @@ impl App {
                 // Ovals never snap (tools-spec §5); the outline uses the
                 // active palette char + pots, like the pencil.
                 self.scratch =
-                    draw::paint_cells(&draw::ellipse_cells(r), &self.ch, self.fg, self.bg);
+                    draw::paint_cells(&draw::ellipse_cells(r), &self.ch, self.fg.clone(), self.bg.clone());
             }
             Tool::Rect => {
                 let c = if shift {
@@ -1376,7 +1378,7 @@ impl App {
                 // Plain rectangle outline in the palette char (Box stays the
                 // smart auto-junction tool).
                 self.scratch =
-                    draw::paint_cells(&draw::rect_cells(r), &self.ch, self.fg, self.bg);
+                    draw::paint_cells(&draw::rect_cells(r), &self.ch, self.fg.clone(), self.bg.clone());
             }
             Tool::Select => {
                 let r = Rect::from_points(a.0, a.1, x, y);
@@ -1458,13 +1460,15 @@ impl App {
                 if self.tool != Tool::Pencil {
                     self.tool = Tool::Pencil;
                 }
-                let bg = match self.bg {
+                let bg = match &self.bg {
                     None => "-".to_string(),
                     Some(PaintColor::Ansi(i)) => i.to_string(),
+                    Some(PaintColor::Theme(name)) => name.clone(),
                     Some(rgb) => rgb.to_hex(),
                 };
-                let fg = match self.fg {
+                let fg = match &self.fg {
                     PaintColor::Ansi(i) => i.to_string(),
+                    PaintColor::Theme(name) => name.clone(),
                     rgb => rgb.to_hex(),
                 };
                 self.set_status(format!("grabbed '{}' fg {fg} bg {bg}", self.ch));
@@ -1494,7 +1498,7 @@ impl App {
         if s.width() == 0 {
             return;
         }
-        let dab = draw::paint_cells(&[(self.cursor.0, self.cursor.1)], &s, self.fg, self.bg);
+        let dab = draw::paint_cells(&[(self.cursor.0, self.cursor.1)], &s, self.fg.clone(), self.bg.clone());
         self.scratch.set_from(&dab);
         self.text_buffer.push(c);
         self.cursor.0 += s.width().max(1) as i32;
@@ -1705,13 +1709,15 @@ mod tests {
     #[test]
     fn truecolor_pots_cycle_set_and_label() {
         let mut app = App::new(test_doc(), None);
-        assert_eq!(app.fg, PaintColor::Ansi(7));
+        // Default pencil follows the live theme foreground variable.
+        assert_eq!(app.fg, PaintColor::Theme("foreground".to_string()));
+        assert_eq!(app.fg_label(), "foreground");
         assert_eq!(app.bg, None);
         assert_eq!(app.bg_label(), "-");
-        // fg cycles Ansi 0-15 with wraparound.
+        // fg cycles Ansi 0-15 with wraparound (from any non-slot pot too).
         app.cycle_fg();
-        assert_eq!(app.fg, PaintColor::Ansi(8));
-        for _ in 0..7 {
+        assert_eq!(app.fg, PaintColor::Ansi(0));
+        for _ in 0..15 {
             app.cycle_fg();
         }
         assert_eq!(app.fg, PaintColor::Ansi(15));

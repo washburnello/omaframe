@@ -181,11 +181,21 @@ pub fn is_transparent_ch(s: &str) -> bool {
 // Paint colors (ANSI slots + truecolor)
 // ---------------------------------------------------------------------------
 
-/// A paint color: a live Omarchy ANSI slot (follows the active theme) or a
-/// fixed truecolor triple (bonus palettes: Pico-8, Picotron).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// A paint color, mirroring btop's `$variable` discipline.
+///
+/// - `Ansi(u8)`: a live terminal slot (legacy files + the fg/bg cycle).
+///   Resolves through the theme's 16-slot ramp.
+/// - `Theme(String)`: a live Omarchy theme variable (`"red"`,
+///   `"background"`, `"accent"`, …). Resolves through the CURRENT theme at
+///   render/export, so wireframes re-tint on theme switch. Lowercase
+///   `key` spellings (`[a-z][a-z0-9_]*`); unknown names fall back to the
+///   theme foreground instead of crashing.
+/// - `Rgb(u8,u8,u8)`: frozen truecolor (legacy files only — no UI path
+///   creates these anymore; the bonus palettes were removed).
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum PaintColor {
     Ansi(u8),
+    Theme(String),
     Rgb(u8, u8, u8),
 }
 
@@ -202,31 +212,39 @@ impl PaintColor {
         Some(PaintColor::Rgb(r, g, b))
     }
 
-    /// Canonical `#rrggbb` (lowercase) for file serialization.
-    pub fn to_hex(self) -> String {
+    /// Canonical `#rrggbb` (lowercase) for file serialization. Theme
+    /// variables serialize as their bare name (`"red"`); ANSI slots never
+    /// reach this path (they save as integers).
+    pub fn to_hex(&self) -> String {
         match self {
             PaintColor::Ansi(i) => format!("ansi{i}"),
+            PaintColor::Theme(name) => name.clone(),
             PaintColor::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
         }
     }
 
-    /// SGR foreground escape body (no `ESC[` prefix): `31`, `93`, or
-    /// `38;2;r;g;b`.
-    pub fn sgr_fg(self) -> String {
-        match self {
-            PaintColor::Ansi(i) if i < 8 => format!("{}", 30 + i as i32),
-            PaintColor::Ansi(i) => format!("{}", 90 + (i as i32 - 8)),
-            PaintColor::Rgb(r, g, b) => format!("38;2;{r};{g};{b}"),
-        }
-    }
-
-    /// SGR background escape body, or `None` for transparent.
-    pub fn sgr_bg(bg: Option<PaintColor>) -> Option<String> {
+    /// Full SGR escape for one colored cell against `theme`
+    /// (`\x1b[…m`, empty for `None`). Legacy ANSI slots keep classic
+    /// symbolic codes so pasted output adapts to the viewer's terminal;
+    /// theme variables and frozen RGB concretize to `38;2`/`48;2`.
+    pub fn cell_escape(
+        fg: &PaintColor,
+        bg: &Option<PaintColor>,
+        theme: &crate::theme::Theme,
+    ) -> String {
+        let fg_code = match fg {
+            PaintColor::Ansi(i) => slot_sgr_fg(*i),
+            other => rgb_sgr_fg(crate::theme::resolve_rgb(other, theme)),
+        };
         match bg {
-            None => None,
-            Some(PaintColor::Ansi(i)) if i < 8 => Some(format!("{}", 40 + i as i32)),
-            Some(PaintColor::Ansi(i)) => Some(format!("{}", 100 + (i as i32 - 8))),
-            Some(PaintColor::Rgb(r, g, b)) => Some(format!("48;2;{r};{g};{b}")),
+            None => format!("\x1b[{fg_code}m"),
+            Some(PaintColor::Ansi(i)) => {
+                format!("\x1b[{fg_code};{}m", slot_sgr_bg(*i))
+            }
+            Some(other) => format!(
+                "\x1b[{fg_code};{}m",
+                rgb_sgr_bg(crate::theme::resolve_rgb(other, theme))
+            ),
         }
     }
 }
@@ -976,12 +994,33 @@ fn check_cell_shape(ch: &str) -> Result<(), ModelError> {
     Ok(())
 }
 
+/// A theme variable name: lowercase `key` spelling (`[a-z][a-z0-9_]*`,
+/// e.g. `"red"`, `"background"`, `"accent"`). Unknown names resolve to the
+/// theme foreground at render (never a crash — custom themes add keys).
+pub fn is_theme_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_lowercase() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
 fn file_fg_to_paint(fc: &FileColor) -> Result<PaintColor, ModelError> {
     match fc {
         FileColor::Int(i) if (0..=15).contains(i) => Ok(PaintColor::Ansi(*i as u8)),
         FileColor::Int(i) => Err(ModelError::BadColor(format!("fg index {i}"))),
         FileColor::Hex(s) => {
-            PaintColor::from_hex(s).ok_or_else(|| ModelError::BadColor(format!("fg {s:?}")))
+            if let Some(rgb) = PaintColor::from_hex(s) {
+                Ok(rgb)
+            } else {
+                let lower = s.to_ascii_lowercase();
+                if is_theme_name(&lower) {
+                    Ok(PaintColor::Theme(lower))
+                } else {
+                    Err(ModelError::BadColor(format!("fg {s:?}")))
+                }
+            }
         }
     }
 }
@@ -991,20 +1030,30 @@ fn file_bg_to_paint(fc: &FileColor) -> Result<Option<PaintColor>, ModelError> {
         FileColor::Int(-1) => Ok(None),
         FileColor::Int(i) if (0..=15).contains(i) => Ok(Some(PaintColor::Ansi(*i as u8))),
         FileColor::Int(i) => Err(ModelError::BadColor(format!("bg index {i}"))),
-        FileColor::Hex(s) => PaintColor::from_hex(s)
-            .map(Some)
-            .ok_or_else(|| ModelError::BadColor(format!("bg {s:?}"))),
+        FileColor::Hex(s) => {
+            if let Some(rgb) = PaintColor::from_hex(s) {
+                Ok(Some(rgb))
+            } else {
+                let lower = s.to_ascii_lowercase();
+                if is_theme_name(&lower) {
+                    Ok(Some(PaintColor::Theme(lower)))
+                } else {
+                    Err(ModelError::BadColor(format!("bg {s:?}")))
+                }
+            }
+        }
     }
 }
 
-fn paint_fg_to_file(fg: PaintColor) -> FileColor {
+fn paint_fg_to_file(fg: &PaintColor) -> FileColor {
     match fg {
-        PaintColor::Ansi(i) => FileColor::Int(i as i8),
+        PaintColor::Ansi(i) => FileColor::Int(*i as i8),
+        PaintColor::Theme(name) => FileColor::Hex(name.clone()),
         PaintColor::Rgb(..) => FileColor::Hex(fg.to_hex()),
     }
 }
 
-fn paint_bg_to_file(bg: Option<PaintColor>) -> FileColor {
+fn paint_bg_to_file(bg: &Option<PaintColor>) -> FileColor {
     match bg {
         // Legacy `-1` spelling: old files stay byte-stable across resaves.
         None => FileColor::Int(-1),
@@ -1110,8 +1159,8 @@ fn document_to_file_doc(doc: &Document) -> Result<FileDoc, ModelError> {
                 x,
                 y,
                 ch: c.ch.clone(),
-                fg: paint_fg_to_file(c.fg),
-                bg: paint_bg_to_file(c.bg),
+                fg: paint_fg_to_file(&c.fg),
+                bg: paint_bg_to_file(&c.bg),
             });
         }
         layers.push(FileLayer {
@@ -1302,16 +1351,47 @@ pub fn render_to_text(doc: &Document) -> String {
 /// One ANSI-export segment: text plus its (fg, bg) paint colors.
 type ColorSeg = (String, Option<(PaintColor, Option<PaintColor>)>);
 
+/// Classic SGR foreground code for a legacy ANSI slot (`30–37`/`90–97`).
+/// Slots intentionally stay symbolic so pasted output adapts to the
+/// viewer's own terminal palette.
+fn slot_sgr_fg(i: u8) -> String {
+    if i < 8 {
+        format!("{}", 30 + i as i32)
+    } else {
+        format!("{}", 90 + (i as i32 - 8))
+    }
+}
+
+/// Classic SGR background code for a legacy ANSI slot, or `None` for
+/// transparent.
+fn slot_sgr_bg(i: u8) -> String {
+    if i < 8 {
+        format!("{}", 40 + i as i32)
+    } else {
+        format!("{}", 100 + (i as i32 - 8))
+    }
+}
+
+fn rgb_sgr_fg((r, g, b): (u8, u8, u8)) -> String {
+    format!("38;2;{r};{g};{b}")
+}
+
+fn rgb_sgr_bg((r, g, b): (u8, u8, u8)) -> String {
+    format!("48;2;{r};{g};{b}")
+}
+
 /// `.md` export: `# name` title plus a fenced `text` block.
 pub fn export_md(doc: &Document) -> String {
     format!("# {}\n```text\n{}```\n", doc.name, export_txt(doc))
 }
 
 /// `.txt+ansi` export: like [`export_txt`] but non-transparent cells carry
-/// SGR color escapes (`30–37`/`90–97` + `38;2;r;g;b` fg, `40–47`/`100–107` +
-/// `48;2;r;g;b` bg; transparent bg emits no background code). Lines are
-/// reset with `\x1b[0m` after their last colored cell.
-pub fn export_ansi(doc: &Document) -> String {
+/// SGR color escapes. Legacy ANSI slots keep classic symbolic codes
+/// (`30–37`/`90–97`, `40–47`/`100–107`) so pasted output adapts to the
+/// viewer's terminal; theme variables and frozen RGB concretize to
+/// `38;2`/`48;2` against `theme`. Transparent bg emits no background code.
+/// Lines are reset with `\x1b[0m` after their last colored cell.
+pub fn export_ansi(doc: &Document, theme: &crate::theme::Theme) -> String {
     let (fx, fy, fw, fh) = export_frame(doc);
     let x_end = (fx as i64 + fw as i64).min(i32::MAX as i64);
     let y_end = (fy as i64 + fh as i64).min(i32::MAX as i64);
@@ -1341,24 +1421,17 @@ pub fn export_ansi(doc: &Document) -> String {
         }
         let mut line = String::new();
         let mut cur: Option<(PaintColor, Option<PaintColor>)> = None;
-        for (s, col) in &segs {
-            if *col != cur {
-                if col.is_none() {
-                    line.push_str("\x1b[0m");
-                } else {
-                    let (fg, bg) = col.expect("matched Some");
-                    match PaintColor::sgr_bg(bg) {
-                        Some(bg_code) => {
-                            line.push_str(&format!("\x1b[{};{}m", fg.sgr_fg(), bg_code));
-                        }
-                        None => {
-                            line.push_str(&format!("\x1b[{}m", fg.sgr_fg()));
-                        }
+        for (s, col) in segs {
+            if col != cur {
+                match &col {
+                    None => line.push_str("\x1b[0m"),
+                    Some((fg, bg)) => {
+                        line.push_str(&PaintColor::cell_escape(fg, bg, theme))
                     }
                 }
-                cur = *col;
+                cur = col;
             }
-            line.push_str(s);
+            line.push_str(&s);
         }
         if cur.is_some() {
             line.push_str("\x1b[0m");
@@ -1769,7 +1842,7 @@ mod tests {
         let back = load_json(&saved).expect("load");
         assert_eq!(doc, back);
         // SGR: truecolor uses 38;2/48;2, ANSI keeps classic codes.
-        let ansi = export_ansi(&back);
+        let ansi = export_ansi(&back, &crate::theme::defaults());
         assert!(ansi.contains("\x1b[38;2;1;2;3;48;2;4;5;6m"), "rgb escapes: {ansi:?}");
         assert!(ansi.contains("\x1b[91m"), "ansi bright fg: {ansi:?}");
         // Legacy -1 bg still loads as transparent; hex garbage fails loud.
@@ -1779,6 +1852,45 @@ mod tests {
         let bad_hex = r##"{"version":1,"name":"x","grid":{"w":5,"h":5},"layers":[{"name":"l","visible":true,"cells":[{"x":0,"y":0,"ch":"a","fg":"#zzzzzz","bg":-1}]}]}"##;
         assert!(matches!(
             load_json(bad_hex).expect_err("bad hex must fail"),
+            ModelError::BadColor(_)
+        ));
+    }
+
+    #[test]
+    fn theme_variables_round_trip_and_concretize() {
+        use crate::theme;
+        // Bare names load as live variables (case-insensitive on input).
+        let named = r#"{"version":1,"name":"x","grid":{"w":5,"h":5},"layers":[{"name":"l","visible":true,"cells":[{"x":0,"y":0,"ch":"a","fg":"RED","bg":"background"}]}]}"#;
+        let doc = load_json(named).expect("names load");
+        assert_eq!(
+            doc.cell(0, 0).unwrap().fg,
+            PaintColor::Theme("red".to_string())
+        );
+        assert_eq!(
+            doc.cell(0, 0).unwrap().bg,
+            Some(PaintColor::Theme("background".to_string()))
+        );
+        // Round-trip preserves the variable spellings.
+        let saved = save_json(&doc).expect("save");
+        assert!(saved.contains("\"red\""), "fg name in file:\n{saved}");
+        assert!(saved.contains("\"background\""), "bg name in file:\n{saved}");
+        assert_eq!(load_json(&saved).expect("reload"), doc);
+        // Export concretizes against the given theme…
+        let theme = theme::from_toml_str("red = \"#112233\"\nbackground = \"#445566\"\n");
+        let ansi = export_ansi(&doc, &theme);
+        assert!(
+            ansi.contains("\x1b[38;2;17;34;51;48;2;68;85;102m"),
+            "concretized: {ansi:?}"
+        );
+        // …so a theme switch re-tints the same file.
+        let theme2 = theme::from_toml_str("red = \"#000001\"\nbackground = \"#000002\"\n");
+        let ansi2 = export_ansi(&doc, &theme2);
+        assert_ne!(ansi, ansi2);
+        assert!(ansi2.contains("\x1b[38;2;0;0;1;48;2;0;0;2m"));
+        // Garbage names fail loud, not silent.
+        let bad = r#"{"version":1,"name":"x","grid":{"w":5,"h":5},"layers":[{"name":"l","visible":true,"cells":[{"x":0,"y":0,"ch":"a","fg":"not a color!","bg":-1}]}]}"#;
+        assert!(matches!(
+            load_json(bad).expect_err("bad name must fail"),
             ModelError::BadColor(_)
         ));
     }
@@ -1795,7 +1907,7 @@ mod tests {
     #[test]
     fn ansi_export_strips_back_to_txt() {
         let doc = load_json(include_str!("../testdata/demo.omaframe.json")).expect("demo");
-        let ansi = export_ansi(&doc);
+        let ansi = export_ansi(&doc, &crate::theme::defaults());
         assert!(ansi.contains("\x1b["), "expected SGR codes");
         // Strip SGR sequences; what remains must equal plain export.
         let mut stripped = String::new();

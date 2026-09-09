@@ -104,7 +104,7 @@ fn color_at(theme: &theme::Theme, group: usize, index: usize) -> Option<PaintCol
         .get(group)?
         .entries
         .get(index)
-        .map(|e| e.color)
+        .map(|e| e.color.clone())
 }
 
 fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {

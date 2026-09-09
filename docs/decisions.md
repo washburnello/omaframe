@@ -35,7 +35,35 @@ from `docs/tools-spec.md` and `skills/omaframe/` so Wave 2 agents are unblocked.
   SKILL.md §2 wording; demo unaffected). SKILL.md to be amended in Wave 2
   if the skill agent's text and model diverge anywhere else.
 
-## Wave 7: voice round (RGB truth, live themes, gaps, nerd chrome)
+## Wave 8: live theme variables (Osaka Jade incident)
+
+User report: theme switch changed nothing. Root cause: `resolved_path`
+never tracked the ACTIVE theme — no `~/.config/omarchy/current/theme`
+symlink exists on this machine, so it fell back to the first-sorted file
+(`picotron`), while the system runs **Osaka Jade** via
+`~/.local/state/omarchy/current/theme/colors.toml` (regenerated per
+switch, name in sibling `theme.name`). The watcher was faithfully
+watching the wrong file.
+
+- **Resolution fixed**: live state dir first, legacy symlink second,
+  sorted fallback third (pure `find_theme_path`, tested). `theme_name`
+  reads `theme.name` for state paths.
+- **Colors are variables now** (btop `$name` discipline):
+  `PaintColor::Theme(name)` resolves through the CURRENT theme at every
+  render/export — snapshots, then ANSI slot, then foreground. Files store
+  bare names (`"red"`); loader lowercases + validates shape; unknown names
+  render as fg (custom-theme keys welcome).
+- **Pico-8/Picotron deleted** (consts, groups, tests, skill mentions).
+  Five groups, all live refs. `Rgb` stays only for legacy files (no UI
+  creates it).
+- **Export takes `&Theme`**: slots keep classic codes (viewer-adaptive),
+  variables/RGB concretize to `38;2`/`48;2`. CLI loads the active theme.
+- **Default pencil = `Theme("foreground")`** so new strokes follow the
+  theme out of the box; fg/bg cycle still walks ANSI slots.
+- QA: 75 tests (incl. same-file-two-themes-different-output proof),
+  clippy clean, golden intact, dumps verified, menu build reinstalled.
+- Remaining: mid-session orange/brown have no ANSI slot (fg fallback);
+  Colors panel still has no jump-to-group shortcut.
 
 User corrections: their theme is NOT picotron (never assume); ANSI-safe
 clamping is a non-goal — RGB accuracy is; theme colors must be live.

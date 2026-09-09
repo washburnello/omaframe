@@ -64,11 +64,14 @@ fn parse_selection(s: &str) -> Result<Rect, String> {
     Ok(Rect::new(x, y, w as u32, h as u32))
 }
 
-/// ANSI export clipped to `rect` (mirrors `model::export_ansi` row rules:
-/// continuation guards emit nothing, trailing transparent cells trimmed,
-/// fully-empty trailing rows skipped, SGR fg + bg with reset after the last
-/// colored cell). Unbounded like the infinite canvas (no grid clip).
-fn export_ansi_selection(doc: &model::Document, rect: &Rect) -> String {
+/// ANSI export clipped to `rect` (mirrors `model::export_ansi` row rules).
+/// Unbounded like the infinite canvas (no grid clip); theme variables
+/// concretize against `theme`.
+fn export_ansi_selection(
+    doc: &model::Document,
+    rect: &Rect,
+    theme: &omaframe::theme::Theme,
+) -> String {
     use omaframe::model::PaintColor;
     type ColorSeg = (String, Option<(PaintColor, Option<PaintColor>)>);
     if rect.is_empty() {
@@ -99,24 +102,17 @@ fn export_ansi_selection(doc: &model::Document, rect: &Rect) -> String {
         }
         let mut line = String::new();
         let mut cur: Option<(PaintColor, Option<PaintColor>)> = None;
-        for (s, col) in &segs {
-            if *col != cur {
-                if col.is_none() {
-                    line.push_str("\x1b[0m");
-                } else {
-                    let (fg, bg) = col.expect("matched Some");
-                    match PaintColor::sgr_bg(bg) {
-                        Some(bg_code) => {
-                            line.push_str(&format!("\x1b[{};{}m", fg.sgr_fg(), bg_code));
-                        }
-                        None => {
-                            line.push_str(&format!("\x1b[{}m", fg.sgr_fg()));
-                        }
+        for (s, col) in segs {
+            if col != cur {
+                match &col {
+                    None => line.push_str("\x1b[0m"),
+                    Some((fg, bg)) => {
+                        line.push_str(&PaintColor::cell_escape(fg, bg, theme))
                     }
                 }
-                cur = *col;
+                cur = col;
             }
-            line.push_str(s);
+            line.push_str(&s);
         }
         if cur.is_some() {
             line.push_str("\x1b[0m");
@@ -212,20 +208,22 @@ pub fn run(args: &[String]) -> Result<String, String> {
     let text = std::fs::read_to_string(&open_path)
         .map_err(|e| format!("cannot read {open_path}: {e}"))?;
     let doc = model::load_json(&text).map_err(|e| format!("cannot load {open_path}: {e}"))?;
+    // ANSI export concretizes theme variables against the active theme.
+    let theme = omaframe::theme::load();
 
     let output = if let Some(sel_str) = selection {
         let rect = parse_selection(&sel_str)?;
         match export_fmt.as_str() {
             "txt" => model::export_selection(&doc, &rect),
             "md" => format!("# {}\n```text\n{}```\n", doc.name, model::export_selection(&doc, &rect)),
-            "ansi" => export_ansi_selection(&doc, &rect),
+            "ansi" => export_ansi_selection(&doc, &rect, &theme),
             _ => return Err(format!("bad --export {export_fmt:?} (want txt|md|ansi)")),
         }
     } else {
         match export_fmt.as_str() {
             "txt" => model::export_txt(&doc),
             "md" => model::export_md(&doc),
-            "ansi" => model::export_ansi(&doc),
+            "ansi" => model::export_ansi(&doc, &theme),
             _ => return Err(format!("bad --export {export_fmt:?} (want txt|md|ansi)")),
         }
     };

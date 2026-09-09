@@ -425,7 +425,7 @@ pub fn paint_cells(
         if erased {
             out.set(x, y, Cell::erased());
         } else {
-            out.set(x, y, Cell::new(ch, fg, bg));
+            out.set(x, y, Cell::new(ch, fg.clone(), bg.clone()));
         }
     }
     out

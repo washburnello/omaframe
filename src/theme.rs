@@ -9,11 +9,14 @@
 //!
 //! Resolution order for [`load`] (never panics, tolerant parse):
 //!
-//! 1. `~/.config/omarchy/current/theme` symlink if present (dir →
+//! 1. `$HOME/.local/state/omarchy/current/theme/colors.toml` — the LIVE
+//!    active theme (Omarchy regenerates this dir on every theme switch,
+//!    so the watcher fires on switch).
+//! 2. `~/.config/omarchy/current/theme` symlink if present (dir →
 //!    `<dir>/colors.toml`, file → itself when named `colors.toml` or a
 //!    theme-name pointer into `themes/<name>/colors.toml`).
-//! 2. First `~/.config/omarchy/themes/*/colors.toml` found (sorted).
-//! 3. Built-in picotron-dark defaults from plan §2.4.
+//! 3. First `~/.config/omarchy/themes/*/colors.toml` found (sorted).
+//! 4. Built-in dark fallback from [`defaults`].
 //!
 //! The on-disk `colors.toml` is parsed manually (simple `key="value"`
 //! lines, no new dependencies). Unknown keys are ignored, missing keys
@@ -219,36 +222,46 @@ fn apply_kv(theme: &mut Theme, kv: &HashMap<String, String>) {
     }
     // Omarchy themes use named colors instead of color0–15: fill any slot
     // the file left unset from the names (explicit colorN always wins).
-    // 0 muted, 1–6 red/green/yellow/blue/magenta/cyan, 7 foreground,
-    // 8 dark_foreground, 9–14 brights, 15 bright_foreground.
     // (`orange`/`brown` have no ANSI slot; they still theme nothing here.)
-    let named_fallback: [(usize, &str); 16] = [
-        (0, "muted"),
-        (1, "red"),
-        (2, "green"),
-        (3, "yellow"),
-        (4, "blue"),
-        (5, "magenta"),
-        (6, "cyan"),
-        (7, "foreground"),
-        (8, "dark_foreground"),
-        (9, "bright_red"),
-        (10, "bright_green"),
-        (11, "bright_yellow"),
-        (12, "bright_blue"),
-        (13, "bright_magenta"),
-        (14, "bright_cyan"),
-        (15, "bright_foreground"),
-    ];
-    for (slot, name) in named_fallback {
+    for (name, slot) in SLOT_FOR_NAME {
         let explicit = format!("color{slot}");
         if kv.get(&explicit).is_some() {
             continue;
         }
         if let Some(c) = kv.get(name).and_then(|v| parse_hex_color(v)) {
-            theme.ansi[slot] = c;
+            theme.ansi[slot as usize] = c;
         }
     }
+}
+
+/// Theme variable → live ANSI slot (inverse of the `apply_kv` fallback).
+/// Names without a slot (`orange`, `brown`, …) have no entry: they resolve
+/// purely through snapshots, else the foreground.
+const SLOT_FOR_NAME: [(&str, u8); 16] = [
+    ("muted", 0),
+    ("red", 1),
+    ("green", 2),
+    ("yellow", 3),
+    ("blue", 4),
+    ("magenta", 5),
+    ("cyan", 6),
+    ("foreground", 7),
+    ("dark_foreground", 8),
+    ("bright_red", 9),
+    ("bright_green", 10),
+    ("bright_yellow", 11),
+    ("bright_blue", 12),
+    ("bright_magenta", 13),
+    ("bright_cyan", 14),
+    ("bright_foreground", 15),
+];
+
+/// Slot for a theme variable name, if it has one.
+pub fn slot_for_name(name: &str) -> Option<u8> {
+    SLOT_FOR_NAME
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, s)| *s)
 }
 
 /// Build a theme from a `colors.toml` string over the built-in defaults.
@@ -271,7 +284,18 @@ pub fn from_toml_str(s: &str) -> Theme {
 /// back to [`defaults`]). Never panics.
 pub fn resolved_path() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
-    let base = PathBuf::from(home).join(".config/omarchy");
+    find_theme_path(std::path::Path::new(&home))
+}
+
+/// Pure core of [`resolved_path`] (testable without touching `$HOME`).
+fn find_theme_path(home: &std::path::Path) -> Option<PathBuf> {
+    // Live state dir first: regenerated on every theme switch, so this
+    // tracks the ACTIVE theme (not merely the first-sorted file).
+    let live = home.join(".local/state/omarchy/current/theme/colors.toml");
+    if live.is_file() {
+        return Some(live);
+    }
+    let base = home.join(".config/omarchy");
     let cur = base.join("current/theme");
 
     if let Ok(meta) = std::fs::symlink_metadata(&cur) {
@@ -461,14 +485,28 @@ impl Default for ThemeWatch {
 }
 
 /// Human theme name for status messages: the theme directory name
-/// (`…/themes/gruvbox/colors.toml` → `gruvbox`), else `"custom"`.
+/// (`…/themes/gruvbox/colors.toml` → `gruvbox`); the live state dir reports
+/// its sibling `theme.name` file (`…/current/theme/` → e.g. `osaka-jade`);
+/// otherwise `"custom"`.
 pub fn theme_name(path: &std::path::Path) -> String {
-    path.parent()
+    let parent_name = path
+        .parent()
         .and_then(|p| p.file_name())
         .and_then(|n| n.to_str())
-        .filter(|n| !n.is_empty())
-        .unwrap_or("custom")
-        .to_string()
+        .unwrap_or("");
+    if parent_name == "theme" {
+        if let Some(current) = path.parent().and_then(|p| p.parent()) {
+            if let Ok(name) = std::fs::read_to_string(current.join("theme.name")) {
+                let name = name.trim();
+                if !name.is_empty() {
+                    return name.to_string();
+                }
+            }
+        }
+    } else if !parent_name.is_empty() {
+        return parent_name.to_string();
+    }
+    "custom".to_string()
 }
 
 /// Ratatui style for a canvas cell.
@@ -497,7 +535,31 @@ pub fn cell_style(
 pub fn resolve(p: PaintColor, theme: &Theme) -> Color {
     match p {
         PaintColor::Ansi(i) => theme.ansi.get(i as usize).copied().unwrap_or(theme.fg),
+        // Live variable (btop `$name` discipline): current theme value,
+        // else its ANSI slot, else the foreground. Re-resolves on every
+        // render, so a theme switch re-tints without touching the file.
+        PaintColor::Theme(name) => {
+            let key = name.to_ascii_lowercase();
+            if let Some(PaintColor::Rgb(r, g, b)) = theme.snapshots.get(&key) {
+                return Color::Rgb(*r, *g, *b);
+            }
+            match slot_for_name(&key) {
+                Some(s) => theme.ansi.get(s as usize).copied().unwrap_or(theme.fg),
+                None => theme.fg,
+            }
+        }
         PaintColor::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
+}
+
+/// Concrete RGB triple for export: theme variables concretize against the
+/// CURRENT theme (export is a snapshot in time); anything else resolves
+/// directly. Non-RGB theme colors (never constructed today) fall back to
+/// white rather than crashing export.
+pub fn resolve_rgb(p: &PaintColor, theme: &Theme) -> (u8, u8, u8) {
+    match resolve(p.clone(), theme) {
+        Color::Rgb(r, g, b) => (r, g, b),
+        _ => (255, 255, 255),
     }
 }
 
@@ -580,157 +642,76 @@ fn capture_snapshots(kv: &HashMap<String, String>) -> HashMap<String, PaintColor
     out
 }
 
-/// Snapshot entry helper: `(label, toml key, theme fallback)`.
-fn snap(
-    theme: &Theme,
-    label: &str,
-    key: &str,
-    fallback: Color,
-) -> ColorEntry {
-    let color = theme
-        .snapshots
-        .get(key)
-        .copied()
-        .unwrap_or_else(|| paint_of(fallback));
-    ColorEntry {
-        label: label.to_string(),
-        color,
-    }
-}
-
-/// Pico-8 standard palette (constant bonus table): `(name, hex)` in slot
-/// order 0–15.
-const PICO8: [(&str, &str); 16] = [
-    ("black", "#000000"),
-    ("dark-blue", "#1d2b53"),
-    ("dark-purple", "#7e2553"),
-    ("dark-green", "#008751"),
-    ("brown", "#ab5236"),
-    ("dark-gray", "#5f574f"),
-    ("light-gray", "#c2c3c7"),
-    ("white", "#fff1e8"),
-    ("red", "#ff004d"),
-    ("orange", "#ffa300"),
-    ("yellow", "#ffec27"),
-    ("green", "#00e436"),
-    ("blue", "#29adff"),
-    ("lavender", "#83769c"),
-    ("pink", "#ff77a8"),
-    ("peach", "#ffccaa"),
-];
-
-/// Picotron secondary palette (constant bonus table): the 16
-/// Picotron-exclusive system colors after the Pico-8-compatible first 16
-/// (`#1c5eac`…`#ff856d`).
-const PICOTRON: [(&str, &str); 16] = [
-    ("royal-blue", "#1c5eac"),
-    ("teal", "#00a5a1"),
-    ("purple", "#754e97"),
-    ("deep-teal", "#125359"),
-    ("brick", "#742f29"),
-    ("coffee", "#492d38"),
-    ("tan", "#a28879"),
-    ("light-pink", "#ffacc5"),
-    ("crimson", "#c3004c"),
-    ("orange", "#eb6b00"),
-    ("lime", "#90ec42"),
-    ("green", "#00b251"),
-    ("sky", "#64dff6"),
-    ("lilac", "#bd9adf"),
-    ("magenta", "#e40dab"),
-    ("salmon", "#ff856d"),
-];
-
 /// Colors-panel groups in display order: Backgrounds, Foregrounds, Accent,
-/// Colors, Brights, Pico-8, Picotron.
+/// Colors, Brights.
 ///
-/// The first five groups are RGB snapshots parsed from the active
-/// `colors.toml` at load; missing keys fall back to the current role
-/// fields (chromatic colors without a role field fall back to the nearest
-/// live ANSI slot: `orange → ansi[10]`, `brown → ansi[1]`; brights fall
-/// back to `ansi[9–14]`). Pico-8 and Picotron are constant tables.
+/// Every entry is a LIVE theme variable (`PaintColor::Theme`), never a
+/// frozen value: swatches and painted cells re-tint on theme switch, btop
+/// `$variable` discipline. (The Pico-8/Picotron bonus palettes were
+/// removed: fixed colors contradict theme-following.)
 pub fn color_groups(theme: &Theme) -> Vec<ColorGroup> {
+    // Silence the unused-theme lint while keeping the signature stable
+    // for future per-theme group shaping.
+    let _ = theme;
     let backgrounds = ColorGroup {
         name: "Backgrounds".to_string(),
         entries: vec![
-            snap(theme, "background", "background", theme.bg),
-            snap(theme, "dark background", "dark_background", theme.bg),
-            snap(theme, "darker background", "darker_background", theme.bg),
-            snap(theme, "lighter background", "lighter_background", theme.bg),
+            var("background", "background"),
+            var("dark background", "dark_background"),
+            var("darker background", "darker_background"),
+            var("lighter background", "lighter_background"),
         ],
     };
     let foregrounds = ColorGroup {
         name: "Foregrounds".to_string(),
         entries: vec![
-            snap(theme, "foreground", "foreground", theme.fg),
-            snap(theme, "dark foreground", "dark_foreground", theme.fg),
-            snap(theme, "light foreground", "light_foreground", theme.fg),
-            snap(theme, "bright foreground", "bright_foreground", theme.fg),
+            var("foreground", "foreground"),
+            var("dark foreground", "dark_foreground"),
+            var("light foreground", "light_foreground"),
+            var("bright foreground", "bright_foreground"),
         ],
     };
     let accent = ColorGroup {
         name: "Accent".to_string(),
         entries: vec![
-            snap(theme, "accent", "accent", theme.accent),
-            snap(theme, "selection", "selection", theme.highlight),
-            snap(theme, "muted", "muted", theme.dim),
+            var("accent", "accent"),
+            var("selection", "selection"),
+            var("muted", "muted"),
         ],
     };
     let colors = ColorGroup {
         name: "Colors".to_string(),
         entries: vec![
-            snap(theme, "red", "red", theme.ansi[1]),
-            snap(theme, "orange", "orange", theme.ansi[10]),
-            snap(theme, "yellow", "yellow", theme.ansi[3]),
-            snap(theme, "green", "green", theme.ansi[2]),
-            snap(theme, "cyan", "cyan", theme.ansi[6]),
-            snap(theme, "blue", "blue", theme.ansi[4]),
-            snap(theme, "magenta", "magenta", theme.ansi[5]),
-            snap(theme, "brown", "brown", theme.ansi[1]),
+            var("red", "red"),
+            var("orange", "orange"),
+            var("yellow", "yellow"),
+            var("green", "green"),
+            var("cyan", "cyan"),
+            var("blue", "blue"),
+            var("magenta", "magenta"),
+            var("brown", "brown"),
         ],
     };
     let brights = ColorGroup {
         name: "Brights".to_string(),
         entries: vec![
-            snap(theme, "bright red", "bright_red", theme.ansi[9]),
-            snap(theme, "bright green", "bright_green", theme.ansi[10]),
-            snap(theme, "bright yellow", "bright_yellow", theme.ansi[11]),
-            snap(theme, "bright blue", "bright_blue", theme.ansi[12]),
-            snap(theme, "bright magenta", "bright_magenta", theme.ansi[13]),
-            snap(theme, "bright cyan", "bright_cyan", theme.ansi[14]),
+            var("bright red", "bright_red"),
+            var("bright green", "bright_green"),
+            var("bright yellow", "bright_yellow"),
+            var("bright blue", "bright_blue"),
+            var("bright magenta", "bright_magenta"),
+            var("bright cyan", "bright_cyan"),
         ],
     };
-    let pico8 = ColorGroup {
-        name: "Pico-8".to_string(),
-        entries: PICO8
-            .iter()
-            .map(|(label, hex)| ColorEntry {
-                label: label.to_string(),
-                color: PaintColor::from_hex(hex)
-                    .expect("Pico-8 table holds valid hex"),
-            })
-            .collect(),
-    };
-    let picotron = ColorGroup {
-        name: "Picotron".to_string(),
-        entries: PICOTRON
-            .iter()
-            .map(|(label, hex)| ColorEntry {
-                label: label.to_string(),
-                color: PaintColor::from_hex(hex)
-                    .expect("Picotron table holds valid hex"),
-            })
-            .collect(),
-    };
-    vec![
-        backgrounds,
-        foregrounds,
-        accent,
-        colors,
-        brights,
-        pico8,
-        picotron,
-    ]
+    vec![backgrounds, foregrounds, accent, colors, brights]
+}
+
+/// One live-variable palette entry: display `label`, paint `key`.
+fn var(label: &str, key: &str) -> ColorEntry {
+    ColorEntry {
+        label: label.to_string(),
+        color: PaintColor::Theme(key.to_string()),
+    }
 }
 
 /// Clickable Colors-panel rows in display order: each group's header, its
@@ -771,6 +752,34 @@ mod tests {
         }
         // `load()` without a theme dir still yields the defaults (never panics).
         let _ = load();
+    }
+
+    #[test]
+    fn resolution_prefers_live_state_dir() {
+        let root = std::env::temp_dir().join("omaframe-resolve-test");
+        let _ = std::fs::remove_dir_all(&root);
+        // Legacy config tree with a decoy theme.
+        let decoy = root.join(".config/omarchy/themes/aaa/colors.toml");
+        std::fs::create_dir_all(decoy.parent().unwrap()).unwrap();
+        std::fs::write(&decoy, "accent = \"#111111\"\n").unwrap();
+        // No state dir yet → legacy fallback (first-sorted).
+        assert_eq!(find_theme_path(&root), Some(decoy.clone()));
+        // Live state dir appears → wins regardless of sort order.
+        let live = root.join(".local/state/omarchy/current/theme/colors.toml");
+        std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+        std::fs::write(&live, "accent = \"#222222\"\n").unwrap();
+        std::fs::write(
+            root.join(".local/state/omarchy/current/theme.name"),
+            "osaka-jade\n",
+        )
+        .unwrap();
+        assert_eq!(find_theme_path(&root), Some(live.clone()));
+        assert_eq!(theme_name(&live), "osaka-jade");
+        // Nothing anywhere → None (caller falls back to defaults).
+        let empty = root.join("empty-home");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(find_theme_path(&empty), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -924,9 +933,7 @@ color3 = "#008751" # trailing comment
                 "Foregrounds",
                 "Accent",
                 "Colors",
-                "Brights",
-                "Pico-8",
-                "Picotron"
+                "Brights"
             ]
         );
         assert_eq!(groups[0].entries.len(), 4);
@@ -934,73 +941,69 @@ color3 = "#008751" # trailing comment
         assert_eq!(groups[2].entries.len(), 3);
         assert_eq!(groups[3].entries.len(), 8);
         assert_eq!(groups[4].entries.len(), 6);
-        assert_eq!(groups[5].entries.len(), 16);
-        assert_eq!(groups[6].entries.len(), 16);
+        // Every entry is a live theme variable, never frozen paint.
+        for g in &groups {
+            for e in &g.entries {
+                assert!(
+                    matches!(e.color, PaintColor::Theme(_)),
+                    "{}:{} is not a variable",
+                    g.name,
+                    e.label
+                );
+            }
+        }
     }
 
     #[test]
-    fn snapshots_override_and_missing_keys_fall_back() {
-        // Empty input: snapshots stay empty, groups fall back to role fields.
-        let t = from_toml_str("");
-        assert!(t.snapshots.is_empty());
-        let groups = color_groups(&t);
-        assert_eq!(
-            groups[0].entries[0].color,
-            paint_of(t.bg),
-            "missing background falls back to theme bg"
-        );
-        assert_eq!(groups[1].entries[0].color, paint_of(t.fg));
-        assert_eq!(groups[2].entries[0].color, paint_of(t.accent));
-
-        // Present keys become frozen RGB snapshots.
+    fn variables_resolve_live_and_fall_back() {
+        use crate::model::PaintColor;
+        // Present keys resolve to the file's values…
         let t2 = from_toml_str(
             "background = \"#112233\"\nred = \"#ff004d\"\nnot-a-key = \"#abcdef\"\n",
         );
-        let g2 = color_groups(&t2);
         assert_eq!(
-            g2[0].entries[0].color,
-            PaintColor::Rgb(0x11, 0x22, 0x33)
+            resolve(PaintColor::Theme("background".to_string()), &t2),
+            Color::Rgb(0x11, 0x22, 0x33)
         );
         assert_eq!(
-            g2[3].entries[0].color,
-            PaintColor::Rgb(0xff, 0, 0x4d)
+            resolve(PaintColor::Theme("red".to_string()), &t2),
+            Color::Rgb(0xff, 0, 0x4d)
         );
-        // Malformed values are skipped (fall back, never crash).
+        // …case-insensitively.
+        assert_eq!(
+            resolve(PaintColor::Theme("RED".to_string()), &t2),
+            Color::Rgb(0xff, 0, 0x4d)
+        );
+        // Missing keys with slots fall back to the slot…
+        let t = from_toml_str("");
+        assert_eq!(
+            resolve(PaintColor::Theme("red".to_string()), &t),
+            t.ansi[1]
+        );
+        // …slotless names (orange/brown) fall back to the foreground…
+        assert_eq!(
+            resolve(PaintColor::Theme("orange".to_string()), &t),
+            t.fg
+        );
+        // …and resolve_rgb concretizes for export.
+        assert_eq!(
+            resolve_rgb(&PaintColor::Theme("background".to_string()), &t2),
+            (0x11, 0x22, 0x33)
+        );
+        // Malformed snapshot values are skipped (fall back, never crash).
         let t3 = from_toml_str("background = \"nope\"\n");
         assert_eq!(
-            color_groups(&t3)[0].entries[0].color,
-            paint_of(t3.bg)
+            resolve(PaintColor::Theme("background".to_string()), &t3),
+            t3.fg
         );
-    }
-
-    #[test]
-    fn pico8_first_last_hex() {
-        let groups = color_groups(&defaults());
-        let pico = &groups[5];
-        assert_eq!(pico.name, "Pico-8");
-        assert_eq!(pico.entries.len(), 16);
-        assert_eq!(pico.entries[0].label, "black");
-        assert_eq!(pico.entries[0].color, PaintColor::Rgb(0, 0, 0));
-        assert_eq!(pico.entries[15].label, "peach");
-        assert_eq!(pico.entries[15].color, PaintColor::Rgb(0xff, 0xcc, 0xaa));
-    }
-
-    #[test]
-    fn picotron_count_first_last() {
-        let groups = color_groups(&defaults());
-        let pt = &groups[6];
-        assert_eq!(pt.name, "Picotron");
-        assert_eq!(pt.entries.len(), 16);
-        assert_eq!(pt.entries[0].color, PaintColor::Rgb(0x1c, 0x5e, 0xac));
-        assert_eq!(pt.entries[15].color, PaintColor::Rgb(0xff, 0x85, 0x6d));
     }
 
     #[test]
     fn color_rows_shape() {
         let t = defaults();
         let rows = color_rows(&t);
-        // 7 headers + Transparent + 57 entries.
-        assert_eq!(rows.len(), 7 + 1 + 57);
+        // 5 headers + Transparent + 25 entries.
+        assert_eq!(rows.len(), 5 + 1 + 25);
         assert_eq!(
             rows[0],
             ColorRow::Header("Backgrounds".to_string())
@@ -1030,7 +1033,7 @@ color3 = "#008751" # trailing comment
             .collect();
         assert_eq!(
             headers,
-            ["Backgrounds", "Foregrounds", "Accent", "Colors", "Brights", "Pico-8", "Picotron"]
+            ["Backgrounds", "Foregrounds", "Accent", "Colors", "Brights"]
         );
     }
 }

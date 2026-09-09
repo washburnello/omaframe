@@ -946,7 +946,7 @@ fn render_canvas(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme
                 .is_some_and(|c| c.is_transparent());
             let composed = app.doc.compose(&app.scratch, doc_x, doc_y);
             let mut st = match &composed {
-                Some(c) => theme::cell_style(c.fg, c.bg, t, app.preview_dark),
+                Some(c) => theme::cell_style(c.fg.clone(), c.bg.clone(), t, app.preview_dark),
                 None => empty_style,
             };
             let glyph = match &composed {
@@ -1143,10 +1143,12 @@ fn render_colors(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme
                 let color = groups
                     .get(*group)
                     .and_then(|g| g.entries.get(*index))
-                    .map(|e| e.color)
+                    .map(|e| e.color.clone())
                     .unwrap_or(PaintColor::Ansi(7));
                 // Pot markers: ▶ fg, ● bg, ◉ both (radio-bullet family).
-                let mark = match (app.fg == color, app.bg == Some(color)) {
+                let is_fg = app.fg == color;
+                let is_bg = matches!(&app.bg, Some(c) if c == &color);
+                let mark = match (is_fg, is_bg) {
                     (true, true) => "◉",
                     (true, false) => "▶",
                     (false, true) => "●",
@@ -1717,31 +1719,28 @@ mod tests {
     fn grouped_colors_rows_render() {
         let t = theme::defaults();
         let rows = theme::color_rows(&t);
-        assert!(
-            rows.len() > 17,
-            "grouped rows exceed the old 17: {}",
-            rows.len()
-        );
+        // 5 headers + Transparent + 25 live-variable entries.
+        assert_eq!(rows.len(), 5 + 1 + 25);
         assert_eq!(rows.len(), colors_total_rows());
-        // A Pico-8 group header exists per the theme contract.
-        let pico = rows
+        // A Colors group header exists per the theme contract.
+        let colors = rows
             .iter()
             .position(|r| {
-                matches!(r, ColorRow::Header(n) if n.to_ascii_lowercase().contains("pico"))
+                matches!(r, ColorRow::Header(n) if n == "Colors")
             })
-            .expect("pico-8 header present");
-        let pico_name = match &rows[pico] {
+            .expect("Colors header present");
+        let colors_name = match &rows[colors] {
             ColorRow::Header(n) => n.clone(),
             _ => unreachable!(),
         };
         // Scroll the header to the top of the window and check the dim
         // `-Name-` row renders.
         let (mut app, t) = (App::new(Document::new("t", 80, 24), None), t);
-        app.colors_scroll = pico;
+        app.colors_scroll = colors;
         let screen = screen_text(&render_to_buf(&mut app, &t));
         assert!(
-            screen.contains(&format!("-{pico_name}-")),
-            "missing header -{pico_name}-:\n{screen}"
+            screen.contains(&format!("-{colors_name}-")),
+            "missing header -{colors_name}-:\n{screen}"
         );
         // Transparent row renders ` -none- ` with the `*` bg marker.
         let transp = rows
@@ -1760,11 +1759,11 @@ mod tests {
                 ColorRow::Entry { group, index } => theme::color_groups(&t)
                     .get(*group)
                     .and_then(|g| g.entries.get(*index))
-                    .map(|e| (i, e.color)),
+                    .map(|e| (i, e.color.clone())),
                 _ => None,
             })
             .expect("at least one entry row");
-        app.fg = entry_color;
+        app.fg = entry_color.clone();
         app.bg = None;
         app.colors_scroll = entry_idx;
         let areas = compute_layout(ratatui::layout::Rect::new(0, 0, 80, 24), 3);
@@ -1782,7 +1781,7 @@ mod tests {
             "missing swatch in {row_text:?}"
         );
         // Both pots on the entry → `◉`; bg pot only → `●`.
-        app.bg = Some(entry_color);
+        app.bg = Some(entry_color.clone());
         let buf = render_to_buf(&mut app, &t);
         assert_eq!(buf[(areas.colors.x, areas.colors.y)].symbol(), "◉");
         app.fg = PaintColor::Ansi(0);

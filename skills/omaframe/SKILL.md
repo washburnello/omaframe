@@ -40,11 +40,12 @@ Cell: `{x, y, ch, fg, bg}`.
 - `ch`: exactly one character. Never store `null`, `""`, or `" "` — a missing
   entry already means "transparent" (sparse storage, like a map; at most one
   entry per `(x, y)` per layer).
-- `fg`: `0`–`15` (Omarchy ANSI slot, `color0`–`color15` — live, follows
-  the active theme) or a frozen truecolor hex `"#rrggbb"` (bonus palettes:
-  Pico-8, Picotron — never re-tinted by theme switches).
-- `bg`: `0`–`15`, or `-1` = transparent (no background paint); or a frozen
-  truecolor hex `"#rrggbb"`.
+- `fg`: a live ANSI slot `0`–`15` (follows the active theme), a live
+  Omarchy theme variable (`"red"`, `"background"`, `"accent"`, … — also
+  follows the theme; this is how the Colors panel paints), or a frozen
+  truecolor hex `"#rrggbb"` (legacy files only, never re-tinted).
+- `bg`: `-1` = transparent (no background paint), else like `fg`
+  (slot, theme variable, or frozen hex).
 
 Transparency and compose ("top-wins"):
 
@@ -97,8 +98,8 @@ its baked cells.
   them into place silently — or rather: refuse and report; never wrap.
 - **Recolor** = change `fg` (or `bg`) in place. Coordinates and `ch`
   stay identical. Example: selected-state highlight = `fg 7` -> `fg 6`.
-  Integer slots are live theme indices; `"#rrggbb"` strings are frozen
-  RGB (use them for Pico-8/Picotron bonus colors).
+  Integer slots and theme-variable names are live (follow the theme);
+  `"#rrggbb"` strings are frozen RGB (legacy).
 - **Label** = append cells to the topmost text layer (`Text`): one cell per
   character, starting at the label's `(x, y)`, skipping spaces (transparent —
   do not store them). Overwriting border cells underneath is expected and
@@ -124,9 +125,11 @@ confirm only the intended lines changed.
    the curated set, say so explicitly, and never use it for load-bearing
    structure (borders, alignment).
 5. **One entry per (x, y) per layer.** A layer is a map. Duplicates are a bug.
-6. **Colors are slots or hex.** `fg` is `0`–`15` or `"#rrggbb"`; `bg` is
-    `-1`–`15` or `"#rrggbb"`. No color names. `bg: -1` unless you mean to
-    paint a background swatch. The demo uses integer slots only.
+6. **Colors are slots, variables, or hex.** `fg` is `0`–`15`, a theme
+    variable name (`"red"`, …), or `"#rrggbb"`; `bg` adds `-1` for
+    transparent. Prefer theme variables for anything that should re-tint
+    with the theme. `bg: -1` unless you mean to paint a background swatch.
+    The demo uses integer slots only.
 7. **Round-trip check.** After patching, validate the JSON parses, re-export
    text, and confirm the diff is exactly what you intended.
 
