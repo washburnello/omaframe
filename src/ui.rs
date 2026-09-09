@@ -539,15 +539,19 @@ const DLG_FOLDER_W: u16 = 7; // "+Folder"
 const DLG_SAVE_W: u16 = 4; // "Open" / "Save"
 
 /// Screen rects for the modal file dialog. `cancel`/`folder`/`save` are the
-/// title-row buttons; `path_row` is the cwd/filename row; `sidebar`/`list`
-/// are the places + entries content rects (header row at `outer.y + 2` is
-/// static and has no hit rect).
+/// title-row buttons; `action_cancel`/`action_confirm` are the same actions
+/// repeated as big buttons in the bottom action row (row `outer.y + dh - 2`,
+/// just above the bottom border); `path_row` is the cwd/filename row;
+/// `sidebar`/`list` are the places + entries content rects (header row at
+/// `outer.y + 2` is static and has no hit rect).
 #[derive(Clone, Copy, Debug)]
 pub struct DialogLayout {
     pub outer: Rect,
     pub cancel: Rect,
     pub folder: Rect,
     pub save: Rect,
+    pub action_cancel: Rect,
+    pub action_confirm: Rect,
     pub path_row: Rect,
     pub sidebar: Rect,
     pub list: Rect,
@@ -561,7 +565,9 @@ pub struct DialogLayout {
 /// `+Folder` centered at `x+(dw-7)/2` (7 wide), `Open`/`Save` at `x+dw-7`
 /// (4 wide, trailing `┌─┐` fills the last 3 cells). `path_row` =
 /// `(x+1, y+1, dw-2, 1)`; `sidebar` =
-/// `(x+1, y+3, 16, dh-4)`; `list` = `(x+18, y+3, dw-19, dh-4)`.
+/// `(x+1, y+3, 16, dh-5)`; `list` = `(x+18, y+3, dw-19, dh-5)`.
+/// Bottom action row at `y+dh-2`: `[ Cancel ]` at `x+2` (10 wide),
+/// `[ Open ]`/`[ Save ]` right-aligned ending at `x+dw-2` (8 wide).
 pub fn dialog_layout(area: Rect) -> Option<DialogLayout> {
     if area.width < MIN_W || area.height < MIN_H {
         return None;
@@ -574,23 +580,26 @@ pub fn dialog_layout(area: Rect) -> Option<DialogLayout> {
     let x = area.x + (area.width - dw) / 2;
     let y = area.y + (area.height - dh) / 2;
     let folder_x = x + (dw - DLG_FOLDER_W) / 2;
+    let action_y = y + dh - 2;
     Some(DialogLayout {
         outer: Rect::new(x, y, dw, dh),
         cancel: Rect::new(x + 3, y, DLG_CANCEL_W, 1),
         folder: Rect::new(folder_x, y, DLG_FOLDER_W, 1),
         save: Rect::new(x + dw.saturating_sub(3 + DLG_SAVE_W), y, DLG_SAVE_W, 1),
+        action_cancel: Rect::new(x + 2, action_y, 10, 1),
+        action_confirm: Rect::new(x + dw.saturating_sub(2 + 8), action_y, 8, 1),
         path_row: Rect::new(x + 1, y + 1, dw.saturating_sub(2), 1),
         sidebar: Rect::new(
             x + 1,
             y + 3,
             DLG_SIDEBAR_W.min(dw.saturating_sub(2)),
-            dh.saturating_sub(4),
+            dh.saturating_sub(5),
         ),
         list: Rect::new(
             x + 1 + DLG_SIDEBAR_W + 1,
             y + 3,
             dw.saturating_sub(DLG_SIDEBAR_W + 3),
-            dh.saturating_sub(4),
+            dh.saturating_sub(5),
         ),
     })
 }
@@ -603,18 +612,19 @@ pub enum DialogButton {
     Save,
 }
 
-/// Map a click to a title-row button (`Cancel` / `+Folder` / `Open|Save`).
-/// Consult before sidebar/list: the buttons own row `outer.y`.
+/// Map a click to a title-row button (`Cancel` / `+Folder` / `Open|Save`)
+/// or a bottom-action-row button (`[ Cancel ]` / `[ Open|Save ]`).
+/// Consult before sidebar/list: the buttons own their rows.
 pub fn hit_dialog_button(
     layout: &DialogLayout,
     col: u16,
     row: u16,
 ) -> Option<DialogButton> {
-    if contains(layout.cancel, col, row) {
+    if contains(layout.cancel, col, row) || contains(layout.action_cancel, col, row) {
         Some(DialogButton::Cancel)
     } else if contains(layout.folder, col, row) {
         Some(DialogButton::Folder)
-    } else if contains(layout.save, col, row) {
+    } else if contains(layout.save, col, row) || contains(layout.action_confirm, col, row) {
         Some(DialogButton::Save)
     } else {
         None
@@ -1627,6 +1637,50 @@ fn render_dialog(f: &mut Frame, area: Rect, app: &App, t: &theme::Theme) {
         );
     }
 
+    // Bottom action row: big `[ Cancel ]` / `[ Open|Save ]` buttons so the
+    // confirm action is unmissable (the title-row labels are easy to miss
+    // in the border chrome). One full-width line so no stale cells show
+    // through behind the buttons. The confirm button dims when there is
+    // nothing valid to confirm yet.
+    {
+        let confirm_label = format!("[ {save_label} ]");
+        let confirm_on = dlg.confirm_path().is_some();
+        let confirm_style = if confirm_on {
+            save_style
+        } else {
+            Style::default().fg(t.dim)
+        };
+        let pad = dw.saturating_sub(2 + 10 + 8 + 2);
+        let mut row = String::from("│ [ Cancel ]");
+        for _ in 0..pad {
+            row.push(' ');
+        }
+        row.push_str(&confirm_label);
+        row.push_str(" │");
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(row, dim),
+                // Re-style the buttons over the dim base: spans overlay in
+                // order, so paint the two labels with their own styles by
+                // re-emitting the whole line as segments.
+            ])),
+            Rect::new(l.outer.x, l.outer.y + l.outer.height - 2, l.outer.width, 1),
+        );
+        // Overlay the button labels with their real styles at exact offsets
+        // (same technique as the title row: text placed at the hit rects).
+        f.render_widget(
+            Paragraph::new(Line::from(vec![Span::styled("[ Cancel ]", btn)])),
+            l.action_cancel,
+        );
+        f.render_widget(
+            Paragraph::new(Line::from(vec![Span::styled(
+                confirm_label,
+                confirm_style,
+            )])),
+            l.action_confirm,
+        );
+    }
+
     // Sides + bottom border.
     panel_sides(f, l.outer, t);
     render_bottom_row(f, l.outer, dw.saturating_sub(2), t);
@@ -2042,11 +2096,28 @@ mod tests {
                 l.sidebar.width,
                 l.sidebar.height
             ),
-            (5, 4, 16, 18)
+            (5, 4, 16, 17)
         );
         assert_eq!(
             (l.list.x, l.list.y, l.list.width, l.list.height),
-            (22, 4, 53, 18)
+            (22, 4, 53, 17)
+        );
+        // Bottom action row: `[ Cancel ]` left, `[ Open|Save ]` right.
+        assert_eq!(
+            (
+                l.action_cancel.x,
+                l.action_cancel.y,
+                l.action_cancel.width
+            ),
+            (6, 21, 10)
+        );
+        assert_eq!(
+            (
+                l.action_confirm.x,
+                l.action_confirm.y,
+                l.action_confirm.width
+            ),
+            (66, 21, 8)
         );
         // Buttons.
         assert_eq!(hit_dialog_button(&l, 7, 1), Some(DialogButton::Cancel));
@@ -2056,6 +2127,12 @@ mod tests {
         assert_eq!(hit_dialog_button(&l, 72, 1), Some(DialogButton::Save));
         assert_eq!(hit_dialog_button(&l, 20, 1), None);
         assert_eq!(hit_dialog_button(&l, 7, 2), None);
+        // Bottom-row buttons hit the same actions.
+        assert_eq!(hit_dialog_button(&l, 6, 21), Some(DialogButton::Cancel));
+        assert_eq!(hit_dialog_button(&l, 15, 21), Some(DialogButton::Cancel));
+        assert_eq!(hit_dialog_button(&l, 66, 21), Some(DialogButton::Save));
+        assert_eq!(hit_dialog_button(&l, 73, 21), Some(DialogButton::Save));
+        assert_eq!(hit_dialog_button(&l, 30, 21), None);
         // Sidebar + list (fake FileDialog struct literal — fields are pub).
         let dlg = fake_dialog(DialogPurpose::SaveAs);
         assert_eq!(hit_dialog_sidebar(&l, &dlg, 5, 4), Some(0));
