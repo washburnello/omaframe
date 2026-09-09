@@ -133,6 +133,22 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
         }
     }
 
+    // --- Inline path prompt (menu Load / Save As): captures all typing ---
+    if app.prompt.is_some() {
+        match code {
+            KeyCode::Esc => app.cancel_prompt(),
+            KeyCode::Enter => app.confirm_prompt(),
+            KeyCode::Backspace => app.prompt_backspace(),
+            KeyCode::Char(c) => {
+                if !ctrl && !alt {
+                    app.prompt_push(c);
+                }
+            }
+            _ => {}
+        }
+        return true;
+    }
+
     // --- Alt combos: tool switching + pots (never typed) ---
     if alt {
         if let KeyCode::Char(c) = code {
@@ -231,7 +247,8 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
             }
             if app.tool == Tool::Pencil {
                 // Uppercase L/A are commands even in pencil (style/arrow);
-                // everything else becomes the pencil char.
+                // `_`/space switch to Pan; everything else becomes the
+                // pencil char.
                 if c == 'L' {
                     app.cycle_box_style();
                     return true;
@@ -248,7 +265,16 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
                     app.cycle_palette_tab(1);
                     return true;
                 }
+                if c == '_' || c == ' ' {
+                    app.set_tool(Tool::Pan);
+                    return true;
+                }
                 app.pick_palette_char(&c.to_string());
+                return true;
+            }
+            // Other tools: single-letter shortcuts (`_`/space pan).
+            if c == '_' || c == ' ' {
+                app.set_tool(Tool::Pan);
                 return true;
             }
             // Other tools: single-letter shortcuts.
@@ -308,6 +334,23 @@ fn handle_mouse(
     let shift = mods.contains(KeyModifiers::SHIFT);
     match kind {
         MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(action) = ui::hit_menu(areas, col, row) {
+                match action {
+                    ui::MenuAction::New => app.new_file(),
+                    ui::MenuAction::Save => app.menu_save(),
+                    ui::MenuAction::Load => app.start_prompt(app::PromptKind::Load),
+                }
+                return;
+            }
+            if let Some(row_idx) = ui::hit_colors(areas, app, col, row) {
+                // Row 0 is transparent-background; rows 1–16 are ANSI 0–15.
+                if row_idx == 0 {
+                    app.set_status("transparent applies to background (right-click)");
+                } else {
+                    app.set_fg(row_idx as i8 - 1);
+                }
+                return;
+            }
             if let Some(t) = ui::hit_tool(areas, col, row) {
                 app.set_tool(t);
                 return;
@@ -338,18 +381,33 @@ fn handle_mouse(
                 return;
             }
             if let Some(pos) = ui::hit_canvas(areas, app, col, row) {
-                handle_canvas_press(app, pos, shift);
+                if app.tool == Tool::Pan {
+                    app.start_pan(col, row);
+                } else {
+                    handle_canvas_press(app, pos, shift);
+                }
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
+            if app.tool == Tool::Pan {
+                // Pan drags work anywhere, not just over the canvas.
+                app.update_pan(col, row);
+                return;
+            }
             if let Some(pos) = ui::hit_canvas(areas, app, col, row) {
                 app.update_stroke(pos.0, pos.1, shift);
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
+            app.end_pan();
             app.end_stroke();
         }
         MouseEventKind::Down(MouseButton::Right) => {
+            if let Some(row_idx) = ui::hit_colors(areas, app, col, row) {
+                // Right-click sets the background pot (row 0 = transparent).
+                app.set_bg(row_idx as i8 - 1);
+                return;
+            }
             if let Some(pos) = ui::hit_canvas(areas, app, col, row) {
                 // decisions.md Q4: right-click = grab into pencil.
                 app.grab_at(pos.0, pos.1);
@@ -374,6 +432,8 @@ fn handle_mouse(
         MouseEventKind::ScrollDown => {
             if ui::over_palette_grid(areas, col, row) {
                 app.scroll_palette(1);
+            } else if ui::over_colors(areas, col, row) {
+                app.scroll_colors(1, areas.colors.height as usize);
             } else if ui::over_canvas(areas, col, row) {
                 // Infinite scroll: wheel pans (Shift+wheel goes horizontal).
                 if shift {
@@ -386,6 +446,8 @@ fn handle_mouse(
         MouseEventKind::ScrollUp => {
             if ui::over_palette_grid(areas, col, row) {
                 app.scroll_palette(-1);
+            } else if ui::over_colors(areas, col, row) {
+                app.scroll_colors(-1, areas.colors.height as usize);
             } else if ui::over_canvas(areas, col, row) {
                 if shift {
                     app.viewport.0 -= 3;

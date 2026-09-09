@@ -39,16 +39,20 @@ pub fn box_style_label(s: draw::BoxStyle) -> &'static str {
 // Palette data (docs/palette-spec.md exact lists)
 // ---------------------------------------------------------------------------
 
-/// Palette tab titles in normative order.
+/// Palette tab titles in normative order (wireframe labels).
 pub const PALETTE_TABS: [&str; 7] = [
     "Letters",
     "Numbers",
     "Symbols",
-    "Outlines",
+    "Outline",
     "Blocks",
-    "Nerds",
+    "Glyphs",
     "Widgets",
 ];
+
+/// Colors panel rows: row 0 is transparent-background, rows 1–16 are ANSI
+/// slots 0–15.
+pub const COLOR_ROWS: usize = 17;
 
 /// Stable lowercase tab ids (persisted in config / per-file `paletteTab`).
 pub const PALETTE_TAB_IDS: [&str; 7] = [
@@ -145,7 +149,7 @@ pub fn palette_chars(tab: usize) -> Vec<String> {
 // Tools + App state
 // ---------------------------------------------------------------------------
 
-/// The 10 tools on the left rail (plan §4.1).
+/// The 11 tools on the left rail: 10 draw tools + Pan.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tool {
     Pencil,
@@ -158,10 +162,11 @@ pub enum Tool {
     Eraser,
     Grab,
     Select,
+    Pan,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 10] = [
+    pub const ALL: [Tool; 11] = [
         Tool::Pencil,
         Tool::Box,
         Tool::Line,
@@ -172,6 +177,7 @@ impl Tool {
         Tool::Eraser,
         Tool::Grab,
         Tool::Select,
+        Tool::Pan,
     ];
 
     pub fn label(self) -> &'static str {
@@ -186,6 +192,7 @@ impl Tool {
             Tool::Eraser => "erase",
             Tool::Grab => "grab",
             Tool::Select => "select",
+            Tool::Pan => "pan",
         }
     }
 
@@ -201,6 +208,7 @@ impl Tool {
             Tool::Eraser => 'e',
             Tool::Grab => 'g',
             Tool::Select => 'v',
+            Tool::Pan => '_',
         }
     }
 
@@ -216,11 +224,27 @@ impl Tool {
             'e' => Some(Tool::Eraser),
             'g' => Some(Tool::Grab),
             'v' | 's' => Some(Tool::Select),
+            '_' => Some(Tool::Pan),
             _ => None,
         }
     }
 }
 
+/// Inline path prompt in the status bar (menu Load / Save As).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PromptKind {
+    Load,
+    SaveAs,
+}
+
+impl PromptKind {
+    pub fn caption(self) -> &'static str {
+        match self {
+            PromptKind::Load => "Load",
+            PromptKind::SaveAs => "Save as",
+        }
+    }
+}
 /// Interactive state. `doc` + `history` are the source of truth; `scratch`
 /// is the live gesture preview rendered above the stack and committed on
 /// release (tools-spec §0).
@@ -238,7 +262,10 @@ pub struct App {
     pub viewport: (i32, i32),
     pub palette_tab: usize,
     pub palette_scroll: usize,
+    pub colors_scroll: usize,
     pub preview_dark: bool,
+    pub prompt: Option<PromptKind>,
+    pub prompt_buf: String,
     pub status_msg: String,
     pub text_buffer: String,
     // --- session state (not in the brief's field list, but required) ---
@@ -269,7 +296,10 @@ impl App {
             viewport: (0, 0),
             palette_tab,
             palette_scroll: 0,
+            colors_scroll: 0,
             preview_dark,
+            prompt: None,
+            prompt_buf: String::new(),
             status_msg: "click-drag draws · wheel scrolls · middle-drag pans · right-click grabs · Ctrl-S saves"
                 .to_string(),
             text_buffer: String::new(),
@@ -285,6 +315,26 @@ impl App {
 
     pub fn set_status(&mut self, msg: impl Into<String>) {
         self.status_msg = msg.into();
+    }
+
+    /// `File: …` menu row: full path (`~`-shortened) with dirty star.
+    pub fn full_path_label(&self) -> String {
+        let base = match &self.file_path {
+            Some(p) => {
+                let s = p.display().to_string();
+                if let Ok(home) = std::env::var("HOME") {
+                    if let Some(rest) = s.strip_prefix(&home) {
+                        format!("~{rest}")
+                    } else {
+                        s
+                    }
+                } else {
+                    s
+                }
+            }
+            None => "untitled".to_string(),
+        };
+        format!("{base}{}", if self.dirty { "*" } else { "" })
     }
 
     pub fn file_label(&self) -> String {
@@ -529,6 +579,171 @@ impl App {
         }
     }
 
+    // --- colors panel (direct fg/bg pots) ---
+
+    /// Set the foreground pot (left-click a swatch).
+    pub fn set_fg(&mut self, idx: i8) {
+        if (0..16).contains(&idx) {
+            self.fg = idx;
+            self.set_status(format!("fg: {idx}"));
+        }
+    }
+
+    /// Set the background pot (right-click a swatch). `-1` = transparent.
+    pub fn set_bg(&mut self, idx: i8) {
+        if (-1..16).contains(&idx) {
+            self.bg = idx;
+            self.set_status(format!(
+                "bg: {}",
+                if idx < 0 {
+                    "-".to_string()
+                } else {
+                    idx.to_string()
+                }
+            ));
+        }
+    }
+
+    /// Scroll the colors list; `visible` is the rows on screen.
+    pub fn scroll_colors(&mut self, dir: i32, visible: usize) {
+        let max = COLOR_ROWS.saturating_sub(visible.max(1));
+        let next = self.colors_scroll as i32 + dir;
+        self.colors_scroll = next.clamp(0, max as i32) as usize;
+    }
+
+    // --- menu file ops + path prompt ---
+
+    /// Expand `~` and relative paths against the current directory.
+    pub fn expand_path(raw: &str) -> PathBuf {
+        let s = raw.trim();
+        if let Some(rest) = s.strip_prefix("~/").or_else(|| s.strip_prefix("~")) {
+            if let Ok(home) = std::env::var("HOME") {
+                return PathBuf::from(home).join(rest.trim_start_matches('/'));
+            }
+        }
+        PathBuf::from(s)
+    }
+
+    fn doc_name_for(path: &PathBuf) -> String {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("untitled")
+            .to_string()
+    }
+
+    /// Menu → New: keeps the file path slot (save first if dirty), starts a
+    /// fresh 80×24 canvas.
+    pub fn new_file(&mut self) {
+        self.autosave();
+        let name = match &self.file_path {
+            Some(p) => Self::doc_name_for(p),
+            None => "untitled".to_string(),
+        };
+        self.doc = Document::new(name, 80, 24);
+        self.history = History::new();
+        self.scratch.clear();
+        self.cursor = (0, 0);
+        self.viewport = (0, 0);
+        self.dirty = false;
+        self.set_status("new canvas (80x24, infinite scroll)");
+    }
+
+    /// Menu → Load (or prompt confirm): replaces the document on success,
+    /// keeps the old one + status on failure.
+    pub fn load_path(&mut self, raw: &str) -> bool {
+        let path = Self::expand_path(raw);
+        match omaframe::model::load_file(&path) {
+            Ok(doc) => {
+                self.preview_dark = doc.preview_dark;
+                self.palette_tab = palette_tab_index(&doc.palette_tab);
+                self.doc = doc;
+                self.file_path = Some(path.clone());
+                self.history = History::new();
+                self.scratch.clear();
+                self.cursor = (0, 0);
+                self.viewport = (0, 0);
+                self.palette_scroll = 0;
+                self.dirty = false;
+                self.set_status(format!("loaded {}", path.display()));
+                true
+            }
+            Err(e) => {
+                self.set_status(format!("load failed: {e}"));
+                false
+            }
+        }
+    }
+
+    /// Save under a new path (menu Save with no path, or Save As prompt).
+    pub fn save_as(&mut self, raw: &str) -> bool {
+        let path = Self::expand_path(raw);
+        match omaframe::model::save_file(&self.doc, &path) {
+            Ok(()) => {
+                self.file_path = Some(path.clone());
+                self.dirty = false;
+                self.set_status(format!("saved {}", path.display()));
+                true
+            }
+            Err(e) => {
+                self.set_status(format!("save failed: {e}"));
+                false
+            }
+        }
+    }
+
+    /// Menu → Save: normal save, or a Save As prompt when pathless.
+    pub fn menu_save(&mut self) {
+        if self.file_path.is_some() {
+            self.save();
+        } else {
+            self.start_prompt(PromptKind::SaveAs);
+        }
+    }
+
+    // --- inline path prompt ---
+
+    pub fn start_prompt(&mut self, kind: PromptKind) {
+        self.prompt = Some(kind);
+        self.prompt_buf.clear();
+    }
+
+    pub fn prompt_push(&mut self, c: char) {
+        if self.prompt.is_some() && !c.is_control() {
+            self.prompt_buf.push(c);
+        }
+    }
+
+    pub fn prompt_backspace(&mut self) {
+        self.prompt_buf.pop();
+    }
+
+    pub fn cancel_prompt(&mut self) {
+        self.prompt = None;
+        self.prompt_buf.clear();
+        self.set_status("cancelled");
+    }
+
+    /// Enter: run the prompt action, keep it open on failure.
+    pub fn confirm_prompt(&mut self) {
+        let (kind, buf) = match (self.prompt, self.prompt_buf.clone()) {
+            (Some(k), b) => (k, b),
+            _ => return,
+        };
+        if buf.trim().is_empty() {
+            self.cancel_prompt();
+            return;
+        }
+        let ok = match kind {
+            PromptKind::Load => self.load_path(&buf),
+            PromptKind::SaveAs => self.save_as(&buf),
+        };
+        if ok {
+            self.prompt = None;
+            self.prompt_buf.clear();
+        }
+    }
+
     // --- shift-constrain helpers (pure, unit-tested) ---
 
     /// Square constraint, anchor corner fixed (tools-spec §2): expand the
@@ -625,6 +840,12 @@ impl App {
                 self.anchor = Some((x, y));
                 self.drawing = true;
                 self.scratch.clear();
+            }
+            Tool::Pan => {
+                // Pan is driven by screen coords (main.rs middle-drag or Pan
+                // tool drags); nothing to anchor on the document grid.
+                self.anchor = None;
+                self.drawing = false;
             }
             _ => {
                 self.anchor = Some((x, y));
@@ -740,7 +961,7 @@ impl App {
                 self.history.set_selection(Some(r));
                 self.set_status(format!("select {}x{}", r.w, r.h));
             }
-            Tool::Text | Tool::Grab => {}
+            Tool::Text | Tool::Grab | Tool::Pan => {}
         }
     }
 
@@ -776,7 +997,7 @@ impl App {
                 self.anchor = None;
                 self.drawing = false;
             }
-            Tool::Text | Tool::Grab => {
+            Tool::Text | Tool::Grab | Tool::Pan => {
                 self.anchor = None;
                 self.drawing = false;
             }
@@ -1100,6 +1321,69 @@ mod tests {
             assert_eq!(c.ch, "#", "oval paints the palette char, no fixed ─/│");
         }
         assert!(painted > 10, "rect + oval left marks");
+    }
+
+    #[test]
+    fn prompt_load_round_trip_and_cancel() {
+        let mut app = App::new(test_doc(), None);
+        // Save the demo doc to a temp path, mutate, then Load it back.
+        let dir = std::env::temp_dir().join("omaframe-prompt-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("p.omaframe.json");
+        let demo = include_str!("../testdata/demo.omaframe.json");
+        std::fs::write(&path, demo).unwrap();
+        app.start_prompt(PromptKind::Load);
+        assert_eq!(app.prompt, Some(PromptKind::Load));
+        for c in path.display().to_string().chars() {
+            app.prompt_push(c);
+        }
+        app.confirm_prompt();
+        assert_eq!(app.prompt, None, "prompt closes on success");
+        assert_eq!(app.doc.name, "settings-panel");
+        assert_eq!(app.file_path, Some(path.clone()));
+        // Failure keeps the prompt open with a status message.
+        app.start_prompt(PromptKind::Load);
+        app.prompt_buf = "/nonexistent-dir-xyz/nope.omaframe.json".to_string();
+        app.confirm_prompt();
+        assert_eq!(app.prompt, Some(PromptKind::Load));
+        assert!(app.status_msg.starts_with("load failed"));
+        app.cancel_prompt();
+        assert_eq!(app.prompt, None);
+        // Tilde expansion.
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(
+            App::expand_path("~/x/y.json"),
+            std::path::PathBuf::from(home).join("x/y.json")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn menu_file_ops_and_color_pots() {
+        let mut app = App::new(test_doc(), None);
+        // New keeps the path slot, resets the canvas.
+        app.file_path = Some(std::path::PathBuf::from("/tmp/n.omaframe.json"));
+        app.dirty = true;
+        app.new_file();
+        assert!(!app.dirty);
+        assert_eq!(app.history.undo_len(), 0);
+        // Pots clamp to their ranges.
+        app.set_fg(3);
+        assert_eq!(app.fg, 3);
+        app.set_fg(99);
+        assert_eq!(app.fg, 3);
+        app.set_bg(-1);
+        assert_eq!(app.bg, -1);
+        app.set_bg(16);
+        assert_eq!(app.bg, -1);
+        // Pan tool shortcut + full path label.
+        assert_eq!(Tool::from_shortcut('_'), Some(Tool::Pan));
+        assert!(app.full_path_label().ends_with("n.omaframe.json"));
+        // Colors scroll clamps to the 17 rows.
+        app.scroll_colors(99, 5);
+        assert_eq!(app.colors_scroll, 12);
+        app.scroll_colors(-99, 5);
+        assert_eq!(app.colors_scroll, 0);
     }
 
     #[test]

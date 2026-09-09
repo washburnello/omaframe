@@ -35,7 +35,32 @@ from `docs/tools-spec.md` and `skills/omaframe/` so Wave 2 agents are unblocked.
   SKILL.md §2 wording; demo unaffected). SKILL.md to be amended in Wave 2
   if the skill agent's text and model diverge anywhere else.
 
-## Wave 3 QA result (user feedback round)
+## Wave 4: user wireframe UI (menu, Colors panel, Pan, borders)
+
+User supplied an ASCII wireframe for the app chrome; implemented as spec'd:
+
+- **Menu bar**: New / Save / Load embedded in the center column's top
+  border (clickable), `File: <full path>*` row below (`~`-shortened).
+  New keeps the path slot; Save without a path opens Save As.
+- **Inline path prompt** in the status bar (Load / Save As): type, Enter
+  confirms (stays open on error), Esc cancels. `~` + relative expansion.
+- **Colors panel** (left, under Tools): transparent row + 16 ANSI swatches
+  with `>` fg / `*` bg / `#` both markers; left-click fg, right-click bg,
+  wheel scrolls. Old palette fg/bg pots removed.
+- **Pan tool** (`_` / Space, 11th rail entry): left-drag pans anywhere;
+  middle-drag still pans. Space/Space-switch skips the Text tool (typing
+  unaffected).
+- **Boxed panels** with titles in borders; canvas origin (`ox,oy`) in its
+  top border; palette divider spans full width (`├┤`).
+- **Tab renames** (labels only, ids stable for file compat):
+  Outlines→Outline, Nerds→Glyphs.
+- **Theme ANSI mapping**: real Omarchy themes use named colors, so unset
+  `colorN` slots now fall back to names (1 red … 7 foreground, 9–15
+  brights, 0 muted, 8 dark_foreground); explicit colorN always wins.
+  Canvas/Colors swatches now follow the live Omarchy theme.
+- QA: 53 tests (incl. headless wireframe-chrome snapshot + prompt
+  round-trip + layout hit-region tests), clippy clean, golden intact,
+  menu build reinstalled.
 
 User reports: (1) rulers confusing → infinite canvas; (2) oval/rect should
 use the palette char; (3) highlighting not working.

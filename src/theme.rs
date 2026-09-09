@@ -208,6 +208,38 @@ fn apply_kv(theme: &mut Theme, kv: &HashMap<String, String>) {
             }
         }
     }
+    // Omarchy themes use named colors instead of color0–15: fill any slot
+    // the file left unset from the names (explicit colorN always wins).
+    // 0 muted, 1–6 red/green/yellow/blue/magenta/cyan, 7 foreground,
+    // 8 dark_foreground, 9–14 brights, 15 bright_foreground.
+    // (`orange`/`brown` have no ANSI slot; they still theme nothing here.)
+    let named_fallback: [(usize, &str); 16] = [
+        (0, "muted"),
+        (1, "red"),
+        (2, "green"),
+        (3, "yellow"),
+        (4, "blue"),
+        (5, "magenta"),
+        (6, "cyan"),
+        (7, "foreground"),
+        (8, "dark_foreground"),
+        (9, "bright_red"),
+        (10, "bright_green"),
+        (11, "bright_yellow"),
+        (12, "bright_blue"),
+        (13, "bright_magenta"),
+        (14, "bright_cyan"),
+        (15, "bright_foreground"),
+    ];
+    for (slot, name) in named_fallback {
+        let explicit = format!("color{slot}");
+        if kv.get(&explicit).is_some() {
+            continue;
+        }
+        if let Some(c) = kv.get(name).and_then(|v| parse_hex_color(v)) {
+            theme.ansi[slot] = c;
+        }
+    }
 }
 
 /// Build a theme from a `colors.toml` string over the built-in defaults.
@@ -449,6 +481,18 @@ color3 = "#008751" # trailing comment
         // Empty/garbage input degrades to defaults, never panics.
         assert_eq!(from_toml_str(""), d);
         assert_eq!(from_toml_str("###\n[[[\n=\n"), d);
+    }
+
+    #[test]
+    fn named_colors_fill_ansi_slots_unless_explicit() {
+        // Real Omarchy themes use names, not colorN: slots follow the names.
+        let t = from_toml_str("red = \"#ff0000\"\nblue = \"#0000ff\"\nmuted = \"#111111\"\n");
+        assert_eq!(t.ansi[1], Color::Rgb(0xff, 0, 0));
+        assert_eq!(t.ansi[4], Color::Rgb(0, 0, 0xff));
+        assert_eq!(t.ansi[0], Color::Rgb(0x11, 0x11, 0x11));
+        // Explicit colorN always wins over the name.
+        let t2 = from_toml_str("color1 = \"#00ff00\"\nred = \"#ff0000\"\n");
+        assert_eq!(t2.ansi[1], Color::Rgb(0, 0xff, 0));
     }
 
     #[test]
