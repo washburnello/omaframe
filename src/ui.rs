@@ -13,7 +13,7 @@ use ratatui::{
 };
 
 use crate::app::{
-    App, DialogPurpose, DirEntry, FileDialog, PALETTE_TABS, Tool, fs_glyphs, palette_chars,
+    App, DialogPurpose, DirEntry, FileDialog, GLYPH_CATEGORIES, PALETTE_TABS, Tool, fs_glyphs,
 };
 use omaframe::model::{self, PaintColor};
 use omaframe::theme;
@@ -55,6 +55,8 @@ pub struct LayoutAreas {
     pub colors: Rect,
     pub canvas: Rect,
     pub palette_tabs: Rect,
+    pub palette_cat: Rect,
+    pub palette_search: Rect,
     pub palette_grid: Rect,
     pub layer_rows: Rect,
     pub too_small: bool,
@@ -62,14 +64,10 @@ pub struct LayoutAreas {
 
 /// Pure layout: identical rects for rendering and mouse mapping.
 ///
-/// ```text
-/// row 0: ┌─┐Tools┌─┐ ┌─┐New┌─┐Save┌─┐Load┌─┐ ┌─┐Palette┌─┐
-/// row 1: │ tool    │ │ File: …          │ │ tabs      │
-/// row 2: │ …       │ └────────────────┘ │ …         │
-/// ```
-/// Panels own their border cells; `*_inner` rects below are the content.
-/// `n_layers` sizes the layers box pinned under the palette.
-pub fn compute_layout(area: Rect, n_layers: usize) -> LayoutAreas {
+/// Palette column (top to bottom): title border, 7 tab rows, divider, an
+/// optional glyph-category stepper row (Glyphs tab only), a search row on
+/// every tab, the grid, bottom border. `tab` sizes the grid accordingly.
+pub fn compute_layout(area: Rect, n_layers: usize, tab: usize) -> LayoutAreas {
     if area.width < MIN_W || area.height < MIN_H {
         return LayoutAreas {
             too_small: true,
@@ -157,11 +155,26 @@ pub fn compute_layout(area: Rect, n_layers: usize) -> LayoutAreas {
         palette_outer.width.saturating_sub(2),
         7,
     );
+    // Category stepper (Glyphs tab only) + universal search row sit
+    // between the divider and the grid.
+    let cat_rows = if tab == 5 { 1 } else { 0 };
+    let palette_cat = Rect::new(
+        palette_outer.x + 1,
+        palette_tabs.y + palette_tabs.height + 1,
+        palette_outer.width.saturating_sub(2),
+        cat_rows,
+    );
+    let palette_search = Rect::new(
+        palette_outer.x + 1,
+        palette_cat.y + palette_cat.height,
+        palette_outer.width.saturating_sub(2),
+        1,
+    );
     let palette_grid = Rect::new(
         palette_outer.x + 1,
-        palette_tabs.y + palette_tabs.height + 1, // +1 skips the divider row
+        palette_search.y + 1,
         palette_outer.width.saturating_sub(2),
-        palette_box_h.saturating_sub(1 + 7 + 1 + 1), // top, tabs, divider, bottom
+        palette_box_h.saturating_sub(1 + 7 + 1 + cat_rows + 1 + 1), // top, tabs, divider, cat, search, bottom
     );
 
     LayoutAreas {
@@ -173,6 +186,8 @@ pub fn compute_layout(area: Rect, n_layers: usize) -> LayoutAreas {
         colors,
         canvas,
         palette_tabs,
+        palette_cat,
+        palette_search,
         palette_grid,
         layer_rows,
         too_small: false,
@@ -217,6 +232,26 @@ pub fn hit_palette_tab(areas: &LayoutAreas, col: u16, row: u16) -> Option<usize>
     }
 }
 
+/// Category stepper hit (Glyphs tab only): left half steps back, right
+/// half steps forward. Returns the direction.
+pub fn hit_glyph_category(
+    areas: &LayoutAreas,
+    app: &App,
+    col: u16,
+    row: u16,
+) -> Option<i32> {
+    if app.palette_tab != 5 || !contains(areas.palette_cat, col, row) {
+        return None;
+    }
+    let mid = areas.palette_cat.x + areas.palette_cat.width / 2;
+    Some(if col < mid { -1 } else { 1 })
+}
+
+/// Search field hit (every tab): focuses the filter for typing.
+pub fn hit_search_field(areas: &LayoutAreas, col: u16, row: u16) -> bool {
+    contains(areas.palette_search, col, row)
+}
+
 /// Grid columns for the active tab (single-char tabs). Widgets tab is a
 /// single-column name list (column 0 only).
 pub fn palette_grid_cols(areas: &LayoutAreas, tab: usize) -> usize {
@@ -235,7 +270,7 @@ pub fn palette_scroll_hint(areas: &LayoutAreas, app: &App) -> (bool, bool) {
     if gh == 0 {
         return (false, false);
     }
-    let len = palette_chars(app.palette_tab).len();
+    let len = app.palette_visible().len();
     if app.palette_tab == 6 {
         (
             app.palette_scroll > 0,
@@ -294,7 +329,8 @@ pub fn hit_palette_scroll(
     None
 }
 
-/// Map a click in the palette grid to a char index into `palette_chars(tab)`.
+/// Map a click in the palette grid to an index into
+/// [`App::palette_visible`] (the filtered list render shows).
 pub fn hit_palette_grid(
     areas: &LayoutAreas,
     app: &App,
@@ -306,7 +342,7 @@ pub fn hit_palette_grid(
     }
     let tab = app.palette_tab;
     let cols = palette_grid_cols(areas, tab);
-    let items = palette_chars(tab);
+    let items = app.palette_visible();
     if tab == 6 {
         let idx = app.palette_scroll + (row - areas.palette_grid.y) as usize;
         return if idx < items.len() { Some(idx) } else { None };
@@ -980,8 +1016,9 @@ fn render_canvas(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme
 }
 
 fn render_palette(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme) {
-    // Boxed panel: title border, tabs, divider, then the char grid (the old
-    // fg/bg pots moved to the Colors panel).
+    // Boxed panel: title border, tabs, divider, category stepper (Glyphs
+    // only), search row, then the char grid.
+    let cat_rows = if app.palette_tab == 5 { 1 } else { 0 };
     let outer = Rect::new(
         areas.palette_tabs.x.saturating_sub(1),
         areas.palette_tabs.y.saturating_sub(1),
@@ -989,6 +1026,8 @@ fn render_palette(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Them
         areas.palette_tabs.height
             + 1 // top border
             + 1 // divider
+            + cat_rows
+            + 1 // search row
             + areas.palette_grid.height
             + 1, // bottom border
     );
@@ -1017,8 +1056,70 @@ fn render_palette(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Them
         )]));
     }
     f.render_widget(Paragraph::new(tab_lines), areas.palette_tabs);
+    // Glyph category stepper (Glyphs tab only): `◀ Arrows ▶`, halves step.
+    if app.palette_tab == 5 {
+        let cat = GLYPH_CATEGORIES
+            .get(app.glyph_category)
+            .copied()
+            .unwrap_or("All");
+        let w = areas.palette_cat.width as usize;
+        let label = format!("◀ {cat} ▶");
+        f.render_widget(
+            Paragraph::new(Line::from(vec![Span::styled(
+                truncate_to(&label, w),
+                Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+            )])),
+            areas.palette_cat,
+        );
+    }
+    // Search row (every tab): magnifier, query + cursor when focused,
+    // `shown/total` count.
+    {
+        let w = areas.palette_search.width as usize;
+        let shown = app.palette_visible().len();
+        let total = app.palette_total();
+        let spans = if app.search_focused {
+            vec![
+                Span::styled(" ", Style::default().fg(t.accent)),
+                Span::styled(app.palette_search.clone(), Style::default().fg(t.fg)),
+                Span::styled("█", Style::default().fg(t.accent)),
+                Span::styled(
+                    format!(" {shown}/{total}"),
+                    Style::default().fg(t.dim),
+                ),
+            ]
+        } else if app.palette_search.is_empty() {
+            vec![
+                Span::styled(" search…", Style::default().fg(t.dim)),
+                Span::styled(format!(" {total}"), Style::default().fg(t.dim)),
+            ]
+        } else {
+            vec![
+                Span::styled(" ", Style::default().fg(t.accent)),
+                Span::styled(app.palette_search.clone(), Style::default().fg(t.fg)),
+                Span::styled(
+                    format!(" {shown}/{total}"),
+                    Style::default().fg(t.dim),
+                ),
+            ]
+        };
+        // Truncate to the row width by dropping tail spans first (count last).
+        let mut line = Line::from(spans);
+        let mut width: usize = line
+            .spans
+            .iter()
+            .map(|s| s.content.chars().count())
+            .sum();
+        while width > w && line.spans.len() > 1 {
+            if let Some(last) = line.spans.pop() {
+                width -= last.content.chars().count();
+            }
+        }
+        f.render_widget(Paragraph::new(line), areas.palette_search);
+    }
     // Grid (scroll arrows overwrite the last slot of the first/last row).
-    let items = palette_chars(app.palette_tab);
+    let items = app.palette_visible();
+    let no_match = items.is_empty() && !app.palette_search.is_empty();
     let cols = palette_grid_cols(areas, app.palette_tab);
     let gh = areas.palette_grid.height as usize;
     let (up, down) = palette_scroll_hint(areas, app);
@@ -1030,6 +1131,13 @@ fn render_palette(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Them
     if app.palette_tab == 6 {
         let gw = areas.palette_grid.width as usize;
         for r in 0..gh {
+            if no_match && r == 0 {
+                lines.push(Line::from(vec![Span::styled(
+                    "no match",
+                    Style::default().fg(t.dim),
+                )]));
+                continue;
+            }
             let idx = app.palette_scroll + r;
             if idx >= items.len() {
                 lines.push(Line::from(""));
@@ -1052,6 +1160,13 @@ fn render_palette(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Them
         }
     } else {
         for r in 0..gh {
+            if no_match && r == 0 {
+                lines.push(Line::from(vec![Span::styled(
+                    "no match",
+                    Style::default().fg(t.dim),
+                )]));
+                continue;
+            }
             let mut spans: Vec<Span> = Vec::new();
             let arrow_row = (up && r == 0) || (down_row_only && r == gh - 1);
             for c in 0..cols {
@@ -1252,7 +1367,7 @@ pub fn render(f: &mut Frame, app: &mut App, t: &theme::Theme) {
     // Clear first: panel gaps belong to no widget and must not smear on
     // resize.
     f.render_widget(Clear, area);
-    let areas = compute_layout(area, app.doc.layers.len());
+    let areas = compute_layout(area, app.doc.layers.len(), app.palette_tab);
     if areas.too_small {
         let msg = format!(
             "terminal too small: need {}x{}, have {}x{} — enlarge to draw",
@@ -1542,7 +1657,7 @@ mod tests {
 
     /// Screen position of a document cell with the default viewport.
     fn screen_of(doc_x: i32, doc_y: i32) -> (u16, u16) {
-        let areas = compute_layout(ratatui::layout::Rect::new(0, 0, 80, 24), 3);
+        let areas = compute_layout(ratatui::layout::Rect::new(0, 0, 80, 24), 3, 3);
         (
             areas.canvas.x + doc_x as u16,
             areas.canvas.y + doc_y as u16,
@@ -1553,7 +1668,7 @@ mod tests {
     fn wireframe_layout_menu_panels_canvas() {
         // 80x24: the wireframe arrangement — menu block over the canvas,
         // tools + colors stacked left, palette right.
-        let a = compute_layout(ratatui::layout::Rect::new(0, 0, 80, 24), 3);
+        let a = compute_layout(ratatui::layout::Rect::new(0, 0, 80, 24), 3, 3);
         assert!(!a.too_small);
         // Menu items sit inside the top border at fixed offsets.
         assert_eq!((a.menu_new.x, a.menu_new.y), (a.menu_top.x + 2, a.menu_top.y));
@@ -1568,15 +1683,34 @@ mod tests {
         assert_eq!(a.tools.height, 11);
         assert_eq!(a.colors.y, a.tools.y + 11 + 2); // + bottom/top borders
         assert!(a.colors.height >= 3);
-        // Palette: 7 tab rows, divider, then grid.
+        // Palette: 7 tab rows, divider, search row, then grid (plus a
+        // category row on the Glyphs tab).
         assert_eq!(a.palette_tabs.height, 7);
-        assert_eq!(a.palette_grid.y, a.palette_tabs.y + 7 + 1);
-        // Colors rows map: 0 transparent, then ANSI slots; clicks outside
-        // the visible rows miss.
+        assert_eq!(a.palette_cat.height, 0, "no category row off tab 5");
+        assert_eq!(a.palette_search.y, a.palette_tabs.y + 7 + 1);
+        assert_eq!(a.palette_grid.y, a.palette_search.y + 1);
         let probe = App::new(
             omaframe::model::Document::new("t", 80, 24),
             None,
         );
+        assert!(hit_search_field(&a, a.palette_search.x, a.palette_search.y));
+        assert_eq!(hit_glyph_category(&a, &probe, a.palette_search.x, a.palette_search.y), None);
+        let g = compute_layout(ratatui::layout::Rect::new(0, 0, 80, 24), 3, 5);
+        assert_eq!(g.palette_cat.height, 1);
+        assert_eq!(g.palette_search.y, g.palette_cat.y + 1);
+        assert_eq!(g.palette_grid.y, g.palette_search.y + 1);
+        let mut gprobe = App::new(
+            omaframe::model::Document::new("t", 80, 24),
+            None,
+        );
+        gprobe.set_palette_tab(5);
+        assert_eq!(hit_glyph_category(&g, &gprobe, g.palette_cat.x, g.palette_cat.y), Some(-1));
+        assert_eq!(
+            hit_glyph_category(&g, &gprobe, g.palette_cat.x + g.palette_cat.width - 1, g.palette_cat.y),
+            Some(1)
+        );
+        // Colors rows map: 0 transparent, then ANSI slots; clicks outside
+        // the visible rows miss.
         assert_eq!(hit_colors(&a, &probe, a.colors.x, a.colors.y), Some(0));
         let last_visible = a.colors.height as usize - 1;
         assert_eq!(
@@ -1596,7 +1730,7 @@ mod tests {
         let (mut app, t) = harness();
         app.set_palette_tab(5);
         let buf = render_to_buf_sized(&mut app, &t, 80, 20);
-        let areas = compute_layout(ratatui::layout::Rect::new(0, 0, 80, 20), 3);
+        let areas = compute_layout(ratatui::layout::Rect::new(0, 0, 80, 20), 3, 5);
         let (up, down) = palette_scroll_hint(&areas, &app);
         assert!(!up && down);
         let gx = areas.palette_grid.x;
@@ -1646,7 +1780,7 @@ mod tests {
         let (harness_app, _) = harness();
         // Harness doc has the default layers; rows show topmost first.
         let n = harness_app.doc.layers.len();
-        let a = compute_layout(ratatui::layout::Rect::new(0, 0, 80, 24), n);
+        let a = compute_layout(ratatui::layout::Rect::new(0, 0, 80, 24), n, 3);
         assert_eq!(a.layer_rows.height, n as u16);
         let y0 = a.layer_rows.y;
         // Row 0 → top layer (idx n-1); last row → Background (idx 0).
@@ -1766,7 +1900,7 @@ mod tests {
         app.fg = entry_color.clone();
         app.bg = None;
         app.colors_scroll = entry_idx;
-        let areas = compute_layout(ratatui::layout::Rect::new(0, 0, 80, 24), 3);
+        let areas = compute_layout(ratatui::layout::Rect::new(0, 0, 80, 24), 3, 3);
         assert_eq!(
             hit_colors(&areas, &app, areas.colors.x, areas.colors.y),
             Some(entry_idx)
@@ -1796,7 +1930,7 @@ mod tests {
         let (mut app, t) = harness();
         let (accent, bg) = (t.accent, t.bg);
         let buf = render_to_buf(&mut app, &t);
-        let areas = compute_layout(ratatui::layout::Rect::new(0, 0, 80, 24), 3);
+        let areas = compute_layout(ratatui::layout::Rect::new(0, 0, 80, 24), 3, 3);
         // Pencil row: nerd pencil icon + `P` hotkey underlined. The active
         // row inverts the hotkey (bg-colored on the accent row) so it stays
         // legible — contrast either way.

@@ -95,9 +95,85 @@ fn nerd_glyphs() -> Vec<String> {
     out
 }
 
-/// Palette contents per tab. Letters/numbers/nerds/widgets are seeded here;
-/// symbols/outlines/blocks come from the sibling `omaframe::chars` module
-/// (single chars; widgets tab holds multi-char stamp names).
+// ---------------------------------------------------------------------------
+// Glyph palette (categorized FA + Octicons, searchable)
+// ---------------------------------------------------------------------------
+
+/// One palette glyph: display char, searchable name, descriptive category.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Glyph {
+    pub ch: String,
+    pub name: String,
+    pub category: String,
+}
+
+/// Glyph category stepper order (`All` first, then alphabetical).
+pub const GLYPH_CATEGORIES: [&str; 21] = [
+    "All",
+    "Arrows",
+    "Brands",
+    "Commerce",
+    "Communication",
+    "Culture & Faith",
+    "Development",
+    "Devices",
+    "Editing",
+    "Files & Folders",
+    "Food & Drink",
+    "Home",
+    "Interface",
+    "Media",
+    "Medical",
+    "Misc",
+    "Nature",
+    "Octicons",
+    "People",
+    "Travel",
+    "Weather & Time",
+];
+
+/// Full glyph list parsed once (`assets/glyphs.txt` is ~2k lines; parsing
+/// per render would be wasteful). Format per line:
+/// `<glyph>  <name>  <U+CODE>  <Category…>` (category runs to EOL).
+pub fn all_glyphs() -> &'static Vec<Glyph> {
+    static CACHE: std::sync::OnceLock<Vec<Glyph>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        const SRC: &str = include_str!("../assets/glyphs.txt");
+        let mut out = Vec::new();
+        for line in SRC.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut parts = line.split_whitespace();
+            let (Some(ch), Some(name), Some(code)) =
+                (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            if !code.starts_with('U') {
+                continue;
+            }
+            // Category runs to end of line (`Files & Folders` has spaces).
+            let category: String = parts.collect::<Vec<_>>().join(" ");
+            if category.is_empty() {
+                continue;
+            }
+            out.push(Glyph {
+                ch: ch.to_string(),
+                name: name.to_string(),
+                category: category.to_string(),
+            });
+        }
+        out
+    })
+}
+
+/// Palette contents per tab. Letters/numbers/widgets are seeded here;
+/// symbols/outlines/blocks come from the sibling `omaframe::chars` module;
+/// glyphs (tab 5) come from [`all_glyphs`] (single chars; widgets tab holds
+/// multi-char stamp names). NOTE: tab 5 ignores category/search filters —
+/// UI code must use [`palette_visible`] instead.
 pub fn palette_chars(tab: usize) -> Vec<String> {
     match tab % 7 {
         0 => ('A'..='Z')
@@ -567,6 +643,9 @@ pub struct App {
     pub viewport: (i32, i32),
     pub palette_tab: usize,
     pub palette_scroll: usize,
+    pub glyph_category: usize,
+    pub palette_search: String,
+    pub search_focused: bool,
     pub colors_scroll: usize,
     pub preview_dark: bool,
     pub file_dialog: Option<FileDialog>,
@@ -600,6 +679,9 @@ impl App {
             viewport: (0, 0),
             palette_tab,
             palette_scroll: 0,
+            glyph_category: 0,
+            palette_search: String::new(),
+            search_focused: false,
             colors_scroll: 0,
             preview_dark,
             file_dialog: None,
@@ -729,7 +811,7 @@ impl App {
     pub fn cycle_palette_tab(&mut self, dir: i32) {
         let n = PALETTE_TABS.len() as i32;
         self.palette_tab = (self.palette_tab as i32 + dir).rem_euclid(n) as usize;
-        self.palette_scroll = 0;
+        self.clear_search();
         self.doc.palette_tab = PALETTE_TAB_IDS[self.palette_tab].to_string();
         self.set_status(format!("palette: {}", PALETTE_TABS[self.palette_tab]));
     }
@@ -738,15 +820,109 @@ impl App {
         if idx < PALETTE_TABS.len() {
             self.palette_tab = idx;
             self.palette_scroll = 0;
+            self.clear_search();
             self.doc.palette_tab = PALETTE_TAB_IDS[idx].to_string();
         }
+    }
+
+    // --- glyph categories + palette search ---
+
+    /// Glyphs passing the current category + search filters (single source
+    /// for render, hit-testing, and scroll math on tab 5).
+    pub fn visible_glyphs(&self) -> Vec<Glyph> {
+        let query = self.palette_search.to_lowercase();
+        all_glyphs()
+            .iter()
+            .filter(|g| {
+                if self.glyph_category > 0 {
+                    let want = GLYPH_CATEGORIES
+                        .get(self.glyph_category)
+                        .copied()
+                        .unwrap_or("All");
+                    if g.category != want {
+                        return false;
+                    }
+                }
+                if !query.is_empty() {
+                    let q = query.as_str();
+                    if !g.name.to_lowercase().contains(q)
+                        && !g.ch.to_lowercase().contains(q)
+                    {
+                        return false;
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// What the palette grid shows for the active tab: glyphs go through
+    /// category + search filters; every other tab filters its display
+    /// strings by the search query (case-insensitive substring).
+    pub fn palette_visible(&self) -> Vec<String> {
+        if self.palette_tab == 5 {
+            return self.visible_glyphs().into_iter().map(|g| g.ch).collect();
+        }
+        let items = palette_chars(self.palette_tab);
+        let query = self.palette_search.to_lowercase();
+        if query.is_empty() {
+            return items;
+        }
+        items
+            .into_iter()
+            .filter(|s| s.to_lowercase().contains(query.as_str()))
+            .collect()
+    }
+
+    /// Unfiltered item count for the active tab (the `/m` in the search
+    /// row's `n/m` count).
+    pub fn palette_total(&self) -> usize {
+        if self.palette_tab == 5 {
+            all_glyphs().len()
+        } else {
+            palette_chars(self.palette_tab).len()
+        }
+    }
+
+    pub fn step_glyph_category(&mut self, dir: i32) {
+        let n = GLYPH_CATEGORIES.len() as i32;
+        self.glyph_category =
+            (self.glyph_category as i32 + dir).rem_euclid(n) as usize;
+        self.palette_scroll = 0;
+    }
+
+    pub fn focus_search(&mut self) {
+        self.search_focused = true;
+    }
+
+    pub fn unfocus_search(&mut self) {
+        self.search_focused = false;
+    }
+
+    pub fn clear_search(&mut self) {
+        self.palette_search.clear();
+        self.search_focused = false;
+        self.palette_scroll = 0;
+    }
+
+    pub fn push_search(&mut self, c: char) {
+        if !c.is_control() {
+            self.palette_search.push(c);
+            self.palette_scroll = 0;
+        }
+    }
+
+    pub fn pop_search(&mut self) {
+        self.palette_search.pop();
+        self.palette_scroll = 0;
     }
 
     /// Scroll the palette grid by `dir` rows. `cols`/`visible` describe the
     /// on-screen grid (row count = ceil(items / cols)); the scroll clamps so
     /// the last content row stays reachable without scrolling into the void.
     pub fn scroll_palette(&mut self, dir: i32, cols: usize, visible: usize) {
-        let len = palette_chars(self.palette_tab).len();
+        let len = self.palette_visible().len();
         let total_rows = len.div_ceil(cols.max(1)).max(1);
         let max = total_rows.saturating_sub(visible.max(1));
         let next = self.palette_scroll as i32 + dir;
@@ -1703,7 +1879,78 @@ mod tests {
         assert!(!palette_chars(2).is_empty());
         assert!(!palette_chars(3).is_empty());
         assert!(!palette_chars(4).is_empty());
-        assert!(!palette_chars(5).is_empty()); // nerds from assets/nerd.txt
+        assert!(!palette_chars(5).is_empty()); // full glyph list
+    }
+
+    #[test]
+    fn glyph_data_is_big_clean_and_categorized() {
+        use std::collections::HashSet;
+        let all = all_glyphs();
+        // Well beyond the old 104-nerd list.
+        assert!(all.len() > 1000, "glyph count: {}", all.len());
+        // Every entry single-cell, non-blank, categorized in the stepper.
+        let cats: HashSet<&str> = GLYPH_CATEGORIES.iter().copied().collect();
+        let mut codes = HashSet::new();
+        for g in all.iter() {
+            assert_eq!(unicode_width::UnicodeWidthStr::width(g.ch.as_str()), 1, "wide: {}", g.name);
+            assert!(!g.name.is_empty() && !g.ch.is_empty());
+            assert!(cats.contains(g.category.as_str()), "unknown cat: {}", g.category);
+            assert!(codes.insert(g.ch.clone()), "dup char: {}", g.name);
+        }
+        // Category stepper covers the file: every category non-empty.
+        for cat in GLYPH_CATEGORIES.iter().skip(1) {
+            assert!(
+                all.iter().any(|g| &g.category == cat),
+                "empty category: {cat}"
+            );
+        }
+    }
+
+    #[test]
+    fn glyph_filter_category_and_search() {
+        let mut app = App::new(test_doc(), None);
+        app.set_palette_tab(5);
+        let total = app.palette_total();
+        assert_eq!(total, all_glyphs().len());
+        assert_eq!(app.palette_visible().len(), total);
+        // Category narrows.
+        let arrows = GLYPH_CATEGORIES.iter().position(|c| *c == "Arrows").unwrap();
+        app.glyph_category = arrows;
+        let shown = app.palette_visible();
+        assert!(!shown.is_empty() && shown.len() < total);
+        // Search narrows within the category; case-insensitive.
+        app.palette_search = "ARROW".to_string();
+        let keys = app.palette_visible();
+        assert!(!keys.is_empty() && keys.len() <= shown.len());
+        // Clearing restores everything; stepper wraps both directions.
+        app.clear_search();
+        assert!(!app.search_focused);
+        assert_eq!(app.palette_visible().len(), shown.len());
+        app.step_glyph_category(1);
+        app.step_glyph_category(-1);
+        assert_eq!(app.glyph_category, arrows);
+        app.glyph_category = 0;
+        app.step_glyph_category(-1);
+        assert_eq!(app.glyph_category, GLYPH_CATEGORIES.len() - 1);
+        // Non-glyph tabs filter their own display strings.
+        app.set_palette_tab(0);
+        app.palette_search = "a".to_string();
+        let letters = app.palette_visible();
+        assert!(letters.contains(&"A".to_string()));
+        assert!(letters.contains(&"a".to_string()));
+        assert!(!letters.contains(&"B".to_string()));
+        // No-match state.
+        app.palette_search = "zzz_no_such_glyph".to_string();
+        assert!(app.palette_visible().is_empty());
+        // Typing helpers reset scroll.
+        app.palette_scroll = 99;
+        app.push_search('x');
+        assert_eq!(app.palette_scroll, 0);
+        app.pop_search();
+        app.focus_search();
+        assert!(app.search_focused);
+        app.unfocus_search();
+        assert!(!app.search_focused);
     }
 
     #[test]

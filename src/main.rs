@@ -24,7 +24,7 @@ use omaframe::model::{Document, PaintColor, load_file};
 use omaframe::{clipboard, theme};
 use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 
-use app::{App, DialogMode, Tool, palette_chars};
+use app::{App, DialogMode, Tool};
 use ui::LayoutAreas;
 
 fn doc_name_for(path: &std::path::Path) -> String {
@@ -237,10 +237,18 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
     // --- Non-Ctrl/Alt keys ---
     match code {
         KeyCode::Esc => {
-            app.cancel_stroke();
+            if app.search_focused {
+                app.clear_search();
+            } else {
+                app.cancel_stroke();
+            }
             true
         }
         KeyCode::Enter => {
+            if app.search_focused {
+                app.unfocus_search();
+                return true;
+            }
             if app.tool == Tool::Text && app.is_text_session() {
                 if shift {
                     app.text_newline();
@@ -277,7 +285,9 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
             true
         }
         KeyCode::Delete => {
-            if app.tool == Tool::Text && app.is_text_session() {
+            if app.search_focused {
+                app.pop_search();
+            } else if app.tool == Tool::Text && app.is_text_session() {
                 app.text_delete();
             } else {
                 app.delete_at_cursor();
@@ -285,7 +295,9 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
             true
         }
         KeyCode::Backspace => {
-            if app.tool == Tool::Text && app.is_text_session() {
+            if app.search_focused {
+                app.pop_search();
+            } else if app.tool == Tool::Text && app.is_text_session() {
                 app.text_backspace();
             } else {
                 app.delete_at_cursor();
@@ -301,10 +313,20 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
             true
         }
         KeyCode::Char(c) => {
+            // Focused palette search captures everything (any tool).
+            if app.search_focused {
+                app.push_search(c);
+                return true;
+            }
             // Text tool types; pencil captures chars as activeCh
             // (palette-spec §4); other tools use single-letter shortcuts.
             if app.tool == Tool::Text {
                 app.type_char(c);
+                return true;
+            }
+            // `/` focuses palette search (pencil keeps `/` only via click).
+            if c == '/' {
+                app.focus_search();
                 return true;
             }
             if app.tool == Tool::Pencil {
@@ -501,6 +523,14 @@ fn handle_mouse(
                 app.set_status(format!("palette: {}", app::PALETTE_TABS[tab]));
                 return;
             }
+            if let Some(dir) = ui::hit_glyph_category(areas, app, col, row) {
+                app.step_glyph_category(dir);
+                return;
+            }
+            if ui::hit_search_field(areas, col, row) {
+                app.focus_search();
+                return;
+            }
             if let Some(dir) = ui::hit_palette_scroll(areas, app, col, row) {
                 // Scroll arrows page by nearly a full grid height.
                 let gh = areas.palette_grid.height as usize;
@@ -510,7 +540,7 @@ fn handle_mouse(
                 return;
             }
             if let Some(idx) = ui::hit_palette_grid(areas, app, col, row) {
-                let items = palette_chars(app.palette_tab);
+                let items = app.palette_visible();
                 if app.palette_tab == 6 {
                     app.set_status(format!(
                         "widget '{}': coming in Phase 3",
@@ -570,7 +600,7 @@ fn handle_mouse(
                 app.grab_at(pos.0, pos.1);
             } else if let Some(idx) = ui::hit_palette_grid(areas, app, col, row) {
                 // Right-click a palette char: textured-panel accent hint.
-                let items = palette_chars(app.palette_tab);
+                let items = app.palette_visible();
                 if let Some(s) = items.get(idx) {
                     app.set_status(format!("bg-accent '{s}': use grab (right-click canvas) then paint"));
                 }
@@ -671,7 +701,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         terminal.draw(|f| ui::render(f, &mut app, &theme))?;
         // Keep the cursor visible after keyboard moves.
         {
-            let areas = ui::compute_layout(term_area(tw, th), app.doc.layers.len());
+            let areas = ui::compute_layout(term_area(tw, th), app.doc.layers.len(), app.palette_tab);
             app.ensure_cursor_visible(areas.canvas.width as i32, areas.canvas.height as i32);
         }
         if app.should_quit {
@@ -687,7 +717,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Event::Mouse(m) => {
                     let term = term_area(tw, th);
-                    let areas = ui::compute_layout(term, app.doc.layers.len());
+                    let areas = ui::compute_layout(term, app.doc.layers.len(), app.palette_tab);
                     handle_mouse(&mut app, &areas, term, &theme, m.kind, m.column, m.row, m.modifiers);
                 }
                 Event::Resize(w, h) => {
