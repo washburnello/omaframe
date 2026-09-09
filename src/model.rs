@@ -99,8 +99,8 @@ pub const FILE_VERSION: u32 = 1;
 pub enum ModelError {
     /// `version` field was not [`FILE_VERSION`].
     BadVersion(u32),
-    /// `fg` not in `0..=15` or `bg` not in `-1..=15`.
-    BadColor { fg: i32, bg: i32 },
+    /// `fg`/`bg` fail validation (bad index, bad hex, wrong JSON type).
+    BadColor(String),
     /// `ch` holds more than one spacing character.
     BadChar(String),
     /// Zero grid dimension, empty layer list, or similar document problem.
@@ -117,8 +117,8 @@ impl fmt::Display for ModelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::BadVersion(v) => write!(f, "unsupported .omaframe.json version {v} (want 1)"),
-            Self::BadColor { fg, bg } => {
-                write!(f, "bad color fg={fg} bg={bg} (want fg 0-15, bg -1-15)")
+            Self::BadColor(msg) => {
+                write!(f, "bad color {msg} (want fg 0-15 or #rrggbb, bg -1-15 or #rrggbb)")
             }
             Self::BadChar(ch) => write!(f, "bad ch {ch:?} (want a single character)"),
             Self::BadGrid(msg) => write!(f, "bad grid: {msg}"),
@@ -177,17 +177,75 @@ pub fn is_transparent_ch(s: &str) -> bool {
 // Cell
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Paint colors (ANSI slots + truecolor)
+// ---------------------------------------------------------------------------
+
+/// A paint color: a live Omarchy ANSI slot (follows the active theme) or a
+/// fixed truecolor triple (bonus palettes: Pico-8, Picotron).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PaintColor {
+    Ansi(u8),
+    Rgb(u8, u8, u8),
+}
+
+impl PaintColor {
+    /// Parse `#rrggbb` (with or without `#`, any case). `None` on garbage.
+    pub fn from_hex(s: &str) -> Option<Self> {
+        let hex = s.trim().strip_prefix('#').unwrap_or(s.trim());
+        if hex.len() != 6 {
+            return None;
+        }
+        let r = u8::from_str_radix(hex.get(0..2)?, 16).ok()?;
+        let g = u8::from_str_radix(hex.get(2..4)?, 16).ok()?;
+        let b = u8::from_str_radix(hex.get(4..6)?, 16).ok()?;
+        Some(PaintColor::Rgb(r, g, b))
+    }
+
+    /// Canonical `#rrggbb` (lowercase) for file serialization.
+    pub fn to_hex(self) -> String {
+        match self {
+            PaintColor::Ansi(i) => format!("ansi{i}"),
+            PaintColor::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
+        }
+    }
+
+    /// SGR foreground escape body (no `ESC[` prefix): `31`, `93`, or
+    /// `38;2;r;g;b`.
+    pub fn sgr_fg(self) -> String {
+        match self {
+            PaintColor::Ansi(i) if i < 8 => format!("{}", 30 + i as i32),
+            PaintColor::Ansi(i) => format!("{}", 90 + (i as i32 - 8)),
+            PaintColor::Rgb(r, g, b) => format!("38;2;{r};{g};{b}"),
+        }
+    }
+
+    /// SGR background escape body, or `None` for transparent.
+    pub fn sgr_bg(bg: Option<PaintColor>) -> Option<String> {
+        match bg {
+            None => None,
+            Some(PaintColor::Ansi(i)) if i < 8 => Some(format!("{}", 40 + i as i32)),
+            Some(PaintColor::Ansi(i)) => Some(format!("{}", 100 + (i as i32 - 8))),
+            Some(PaintColor::Rgb(r, g, b)) => Some(format!("48;2;{r};{g};{b}")),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cell
+// ---------------------------------------------------------------------------
+
 /// One painted cell.
 ///
 /// `ch` holds a single grapheme (usually one `char`; a base char plus one
 /// combining mark also round-trips). Empty / `" "` / `"\0"` all mean
-/// transparent (see [`Cell::is_transparent`]). `fg` is an ANSI slot `0..=15`;
-/// `bg` is `0..=15` or `-1` = transparent.
+/// transparent (see [`Cell::is_transparent`]). `fg` is the paint color;
+/// `bg` is `None` = transparent.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Cell {
     pub ch: String,
-    pub fg: i8,
-    pub bg: i8,
+    pub fg: PaintColor,
+    pub bg: Option<PaintColor>,
 }
 
 impl Cell {
@@ -195,7 +253,7 @@ impl Cell {
     /// `Layer.set`, this constructor does not validate; boundary checks
     /// live in [`Cell::validate`] (called by [`load_json`] and
     /// [`save_json`]).
-    pub fn new(ch: impl Into<String>, fg: i8, bg: i8) -> Self {
+    pub fn new(ch: impl Into<String>, fg: PaintColor, bg: Option<PaintColor>) -> Self {
         Self {
             ch: ch.into(),
             fg,
@@ -207,8 +265,8 @@ impl Cell {
     pub fn erased() -> Self {
         Self {
             ch: String::new(),
-            fg: 0,
-            bg: -1,
+            fg: PaintColor::Ansi(0),
+            bg: None,
         }
     }
 
@@ -228,11 +286,15 @@ impl Cell {
     /// (a lone base char, a wide char, or base + one combining mark).
     /// Transparent and zero-width cells are valid (they canonicalize away).
     pub fn validate(&self) -> Result<(), ModelError> {
-        if !(0..=15).contains(&self.fg) || !(-1..=15).contains(&self.bg) {
-            return Err(ModelError::BadColor {
-                fg: self.fg as i32,
-                bg: self.bg as i32,
-            });
+        if let PaintColor::Ansi(i) = self.fg {
+            if i > 15 {
+                return Err(ModelError::BadColor(format!("fg index {i}")));
+            }
+        }
+        if let Some(PaintColor::Ansi(i)) = self.bg {
+            if i > 15 {
+                return Err(ModelError::BadColor(format!("bg index {i}")));
+            }
         }
         let nchars = self.ch.chars().count();
         if nchars > 2 || (nchars == 2 && width_of(&self.ch) > 1) {
@@ -816,16 +878,27 @@ impl History {
 // File format (.omaframe.json read/write)
 // ---------------------------------------------------------------------------
 
-/// Wire cell: schema `{x, y, ch, fg, bg}`. Colors stay `i32` through parse
-/// so out-of-range values become [`ModelError::BadColor`] (never a bare
-/// JSON type error, never a silent clamp).
+/// Wire color: an ANSI index or a `#rrggbb` string (untagged, so old
+/// integer-only files keep parsing). `bg` additionally allows `-1` =
+/// transparent (legacy spelling, still written on save for stability).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum FileColor {
+    Int(i8),
+    Hex(String),
+}
+
+/// Wire cell: schema `{x, y, ch, fg, bg}`. `fg` is `0..=15` or `#rrggbb`;
+/// `bg` adds `-1` = transparent. Out-of-range values become
+/// [`ModelError::BadColor`] (never a bare JSON type error, never a silent
+/// clamp).
 #[derive(Debug, Serialize, Deserialize)]
 struct FileCell {
     x: i32,
     y: i32,
     ch: String,
-    fg: i32,
-    bg: i32,
+    fg: FileColor,
+    bg: FileColor,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -903,24 +976,52 @@ fn check_cell_shape(ch: &str) -> Result<(), ModelError> {
     Ok(())
 }
 
-fn file_cell_to_validated(fc: &FileCell) -> Result<Option<Cell>, ModelError> {
-    if !(0..=15).contains(&fc.fg) || !(-1..=15).contains(&fc.bg) {
-        return Err(ModelError::BadColor {
-            fg: fc.fg,
-            bg: fc.bg,
-        });
+fn file_fg_to_paint(fc: &FileColor) -> Result<PaintColor, ModelError> {
+    match fc {
+        FileColor::Int(i) if (0..=15).contains(i) => Ok(PaintColor::Ansi(*i as u8)),
+        FileColor::Int(i) => Err(ModelError::BadColor(format!("fg index {i}"))),
+        FileColor::Hex(s) => {
+            PaintColor::from_hex(s).ok_or_else(|| ModelError::BadColor(format!("fg {s:?}")))
+        }
     }
+}
+
+fn file_bg_to_paint(fc: &FileColor) -> Result<Option<PaintColor>, ModelError> {
+    match fc {
+        FileColor::Int(-1) => Ok(None),
+        FileColor::Int(i) if (0..=15).contains(i) => Ok(Some(PaintColor::Ansi(*i as u8))),
+        FileColor::Int(i) => Err(ModelError::BadColor(format!("bg index {i}"))),
+        FileColor::Hex(s) => PaintColor::from_hex(s)
+            .map(Some)
+            .ok_or_else(|| ModelError::BadColor(format!("bg {s:?}"))),
+    }
+}
+
+fn paint_fg_to_file(fg: PaintColor) -> FileColor {
+    match fg {
+        PaintColor::Ansi(i) => FileColor::Int(i as i8),
+        PaintColor::Rgb(..) => FileColor::Hex(fg.to_hex()),
+    }
+}
+
+fn paint_bg_to_file(bg: Option<PaintColor>) -> FileColor {
+    match bg {
+        // Legacy `-1` spelling: old files stay byte-stable across resaves.
+        None => FileColor::Int(-1),
+        Some(c) => paint_fg_to_file(c),
+    }
+}
+
+fn file_cell_to_validated(fc: &FileCell) -> Result<Option<Cell>, ModelError> {
+    let fg = file_fg_to_paint(&fc.fg)?;
+    let bg = file_bg_to_paint(&fc.bg)?;
     check_cell_shape(&fc.ch)?;
     // Canonicalize: transparent and zero-width entries compose identically
     // to absent, so the sparse layer simply omits them.
     if is_transparent_ch(&fc.ch) || width_of(&fc.ch) == 0 {
         return Ok(None);
     }
-    Ok(Some(Cell {
-        ch: fc.ch.clone(),
-        fg: fc.fg as i8,
-        bg: fc.bg as i8,
-    }))
+    Ok(Some(Cell { ch: fc.ch.clone(), fg, bg }))
 }
 
 fn file_doc_to_document(fd: FileDoc) -> Result<Document, ModelError> {
@@ -1009,8 +1110,8 @@ fn document_to_file_doc(doc: &Document) -> Result<FileDoc, ModelError> {
                 x,
                 y,
                 ch: c.ch.clone(),
-                fg: c.fg as i32,
-                bg: c.bg as i32,
+                fg: paint_fg_to_file(c.fg),
+                bg: paint_bg_to_file(c.bg),
             });
         }
         layers.push(FileLayer {
@@ -1198,23 +1299,8 @@ pub fn render_to_text(doc: &Document) -> String {
     export_txt(doc)
 }
 
-fn fg_sgr(fg: i8) -> i32 {
-    if fg < 8 {
-        30 + fg as i32
-    } else {
-        90 + (fg as i32 - 8)
-    }
-}
-
-fn bg_sgr(bg: i8) -> Option<i32> {
-    if bg < 0 {
-        None
-    } else if bg < 8 {
-        Some(40 + bg as i32)
-    } else {
-        Some(100 + (bg as i32 - 8))
-    }
-}
+/// One ANSI-export segment: text plus its (fg, bg) paint colors.
+type ColorSeg = (String, Option<(PaintColor, Option<PaintColor>)>);
 
 /// `.md` export: `# name` title plus a fenced `text` block.
 pub fn export_md(doc: &Document) -> String {
@@ -1222,9 +1308,9 @@ pub fn export_md(doc: &Document) -> String {
 }
 
 /// `.txt+ansi` export: like [`export_txt`] but non-transparent cells carry
-/// SGR color escapes from their fg/bg slots (`30–37`/`90–97`,
-/// `40–47`/`100–107`; `bg = -1` emits no background code). Lines are reset
-/// with `\x1b[0m` after their last colored cell.
+/// SGR color escapes (`30–37`/`90–97` + `38;2;r;g;b` fg, `40–47`/`100–107` +
+/// `48;2;r;g;b` bg; transparent bg emits no background code). Lines are
+/// reset with `\x1b[0m` after their last colored cell.
 pub fn export_ansi(doc: &Document) -> String {
     let (fx, fy, fw, fh) = export_frame(doc);
     let x_end = (fx as i64 + fw as i64).min(i32::MAX as i64);
@@ -1233,7 +1319,7 @@ pub fn export_ansi(doc: &Document) -> String {
     for y in fy..y_end as i32 {
         // (text, color) segments so trailing spaces can be trimmed before
         // any escape is emitted.
-        let mut segs: Vec<(String, Option<(i8, i8)>)> = Vec::new();
+        let mut segs: Vec<ColorSeg> = Vec::new();
         for x in fx..x_end as i32 {
             if doc.is_continuation(x, y) {
                 continue;
@@ -1254,19 +1340,19 @@ pub fn export_ansi(doc: &Document) -> String {
             continue;
         }
         let mut line = String::new();
-        let mut cur: Option<(i8, i8)> = None;
+        let mut cur: Option<(PaintColor, Option<PaintColor>)> = None;
         for (s, col) in &segs {
             if *col != cur {
                 if col.is_none() {
                     line.push_str("\x1b[0m");
                 } else {
-                    let (fg, bg) = col.unwrap();
-                    match bg_sgr(bg) {
+                    let (fg, bg) = col.expect("matched Some");
+                    match PaintColor::sgr_bg(bg) {
                         Some(bg_code) => {
-                            line.push_str(&format!("\x1b[{};{}m", fg_sgr(fg), bg_code));
+                            line.push_str(&format!("\x1b[{};{}m", fg.sgr_fg(), bg_code));
                         }
                         None => {
-                            line.push_str(&format!("\x1b[{}m", fg_sgr(fg)));
+                            line.push_str(&format!("\x1b[{}m", fg.sgr_fg()));
                         }
                     }
                 }
@@ -1294,7 +1380,15 @@ mod tests {
     use super::*;
 
     fn cell(ch: &str, fg: i8, bg: i8) -> Cell {
-        Cell::new(ch, fg, bg)
+        Cell::new(
+            ch,
+            PaintColor::Ansi(fg as u8),
+            if bg < 0 {
+                None
+            } else {
+                Some(PaintColor::Ansi(bg as u8))
+            },
+        )
     }
 
     fn paint(doc: &mut Document, layer_idx: usize, x: i32, y: i32, ch: &str, fg: i8) -> bool {
@@ -1519,12 +1613,12 @@ mod tests {
         let bad_fg = r#"{"version":1,"name":"x","grid":{"w":5,"h":5},"layers":[{"name":"l","visible":true,"cells":[{"x":0,"y":0,"ch":"a","fg":16,"bg":-1}]}]}"#;
         assert!(matches!(
             load_json(bad_fg).expect_err("fg 16 must fail"),
-            ModelError::BadColor { fg: 16, .. }
+            ModelError::BadColor(_)
         ));
         let bad_bg = r#"{"version":1,"name":"x","grid":{"w":5,"h":5},"layers":[{"name":"l","visible":true,"cells":[{"x":0,"y":0,"ch":"a","fg":1,"bg":-2}]}]}"#;
         assert!(matches!(
             load_json(bad_bg).expect_err("bg -2 must fail"),
-            ModelError::BadColor { bg: -2, .. }
+            ModelError::BadColor(_)
         ));
         // Multi-char ch.
         let bad_ch = r#"{"version":1,"name":"x","grid":{"w":5,"h":5},"layers":[{"name":"l","visible":true,"cells":[{"x":0,"y":0,"ch":"ab","fg":1,"bg":-1}]}]}"#;
@@ -1626,14 +1720,14 @@ mod tests {
         let mut doc = Document::new("t", 80, 24);
         assert_eq!(content_bounds(&doc), None);
         // Content inside the grid: frame is the grid (golden-compatible).
-        doc.active_layer_mut().set(2, 3, Cell::new("x", 7, -1));
+        doc.active_layer_mut().set(2, 3, cell("x", 7, -1));
         assert_eq!(
             content_bounds(&doc),
             Some(Rect::new(2, 3, 1, 1))
         );
         // Content beyond (and before) the grid expands the export frame.
-        doc.active_layer_mut().set(100, 50, Cell::new("y", 7, -1));
-        doc.active_layer_mut().set(-4, -2, Cell::new("z", 7, -1));
+        doc.active_layer_mut().set(100, 50, cell("y", 7, -1));
+        doc.active_layer_mut().set(-4, -2, cell("z", 7, -1));
         let b = content_bounds(&doc).expect("bounds");
         assert_eq!((b.x, b.y), (-4, -2));
         let txt = export_txt(&doc);
@@ -1646,6 +1740,47 @@ mod tests {
             nl.visible = false;
         }
         assert_eq!(content_bounds(&doc), None);
+    }
+
+    #[test]
+    fn truecolor_hex_round_trip_and_sgr() {
+        assert_eq!(
+            PaintColor::from_hex("#ff004d"),
+            Some(PaintColor::Rgb(0xff, 0, 0x4d))
+        );
+        assert_eq!(
+            PaintColor::from_hex("00e436"),
+            Some(PaintColor::Rgb(0, 0xe4, 0x36))
+        );
+        assert_eq!(PaintColor::from_hex("nope"), None);
+        assert_eq!(PaintColor::from_hex("#12345"), None);
+        // Hex cells round-trip through JSON.
+        let mut doc = Document::new("rgb", 10, 5);
+        doc.active_layer_mut().set(
+            1,
+            1,
+            Cell::new("x", PaintColor::Rgb(1, 2, 3), Some(PaintColor::Rgb(4, 5, 6))),
+        );
+        doc.active_layer_mut()
+            .set(2, 1, Cell::new("y", PaintColor::Ansi(9), None));
+        let saved = save_json(&doc).expect("save");
+        assert!(saved.contains("#010203"), "fg hex in file:\n{saved}");
+        assert!(saved.contains("#040506"), "bg hex in file:\n{saved}");
+        let back = load_json(&saved).expect("load");
+        assert_eq!(doc, back);
+        // SGR: truecolor uses 38;2/48;2, ANSI keeps classic codes.
+        let ansi = export_ansi(&back);
+        assert!(ansi.contains("\x1b[38;2;1;2;3;48;2;4;5;6m"), "rgb escapes: {ansi:?}");
+        assert!(ansi.contains("\x1b[91m"), "ansi bright fg: {ansi:?}");
+        // Legacy -1 bg still loads as transparent; hex garbage fails loud.
+        let legacy = r#"{"version":1,"name":"x","grid":{"w":5,"h":5},"layers":[{"name":"l","visible":true,"cells":[{"x":0,"y":0,"ch":"a","fg":1,"bg":-1}]}]}"#;
+        let doc = load_json(legacy).expect("legacy loads");
+        assert_eq!(doc.cell(0, 0).unwrap().bg, None);
+        let bad_hex = r##"{"version":1,"name":"x","grid":{"w":5,"h":5},"layers":[{"name":"l","visible":true,"cells":[{"x":0,"y":0,"ch":"a","fg":"#zzzzzz","bg":-1}]}]}"##;
+        assert!(matches!(
+            load_json(bad_hex).expect_err("bad hex must fail"),
+            ModelError::BadColor(_)
+        ));
     }
 
     #[test]

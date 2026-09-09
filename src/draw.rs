@@ -24,20 +24,21 @@
 //! into a scratch layer in place.
 //!
 //! Default colors: `draw_box` / `draw_line` / `draw_ellipse` emit cells with
-//! `fg = 7`, `bg = -1` (neutral light-gray, transparent background). The
-//! caller (pots/tools) recolors by rewriting the patch cells before commit;
-//! [`snap_patch`] preserves each cell's existing colors when it re-glyphs.
-//! [`paint_cells`] uses the caller-supplied `fg`/`bg` verbatim, except that
-//! transparent spellings (`""`, `" "`, `"\0"`) become [`Cell::erased`].
+//! `fg = DRAW_FG` (`Ansi(7)`) and `bg = None` (neutral light-gray,
+//! transparent background). The caller (pots/tools) recolors by rewriting
+//! the patch cells before commit; [`snap_patch`] preserves each cell's
+//! existing colors when it re-glyphs. [`paint_cells`] uses the
+//! caller-supplied `fg`/`bg` verbatim, except that transparent spellings
+//! (`""`, `" "`, `"\0"`) become [`Cell::erased`].
 
 use std::collections::HashSet;
 
-use crate::model::{Cell, Document, Layer, Rect};
+use crate::model::{Cell, Document, Layer, PaintColor, Rect};
 
 /// Default foreground for `draw_*` builders (neutral light-gray).
-pub const DRAW_FG: i8 = 7;
+pub const DRAW_FG: PaintColor = PaintColor::Ansi(7);
 /// Default background for `draw_*` builders (transparent).
-pub const DRAW_BG: i8 = -1;
+pub const DRAW_BG: Option<PaintColor> = None;
 
 /// Outline style for [`draw_box`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -86,18 +87,18 @@ pub fn draw_box(r: Rect, style: BoxStyle) -> Layer {
     let bottom = r.y as i64 + r.h as i64 - 1;
     if r.w > 1 {
         for x in left..=right {
-            out.set(x as i32, top as i32, Cell::new(hch, DRAW_FG, DRAW_BG));
+            out.set(x as i32, top as i32, Cell::new(hch, DRAW_FG, None));
             // Avoid double-insert when h == 1 (single row).
             if bottom != top {
-                out.set(x as i32, bottom as i32, Cell::new(hch, DRAW_FG, DRAW_BG));
+                out.set(x as i32, bottom as i32, Cell::new(hch, DRAW_FG, None));
             }
         }
     }
     if r.h > 1 {
         for y in top..=bottom {
-            out.set(left as i32, y as i32, Cell::new(vch, DRAW_FG, DRAW_BG));
+            out.set(left as i32, y as i32, Cell::new(vch, DRAW_FG, None));
             if right != left {
-                out.set(right as i32, y as i32, Cell::new(vch, DRAW_FG, DRAW_BG));
+                out.set(right as i32, y as i32, Cell::new(vch, DRAW_FG, None));
             }
         }
     }
@@ -105,22 +106,22 @@ pub fn draw_box(r: Rect, style: BoxStyle) -> Layer {
         out.set(
             left as i32,
             top as i32,
-            Cell::new(corners[0], DRAW_FG, DRAW_BG),
+            Cell::new(corners[0], DRAW_FG, None),
         );
         out.set(
             right as i32,
             top as i32,
-            Cell::new(corners[1], DRAW_FG, DRAW_BG),
+            Cell::new(corners[1], DRAW_FG, None),
         );
         out.set(
             right as i32,
             bottom as i32,
-            Cell::new(corners[2], DRAW_FG, DRAW_BG),
+            Cell::new(corners[2], DRAW_FG, None),
         );
         out.set(
             left as i32,
             bottom as i32,
-            Cell::new(corners[3], DRAW_FG, DRAW_BG),
+            Cell::new(corners[3], DRAW_FG, None),
         );
     }
     out
@@ -163,12 +164,12 @@ fn draw_straight_into(out: &mut Layer, x0: i32, y0: i32, x1: i32, y1: i32) {
     if x0 == x1 {
         let (top, bottom) = (y0.min(y1), y0.max(y1));
         for y in top..=bottom {
-            out.set(x0, y, Cell::new("│", DRAW_FG, DRAW_BG));
+            out.set(x0, y, Cell::new("│", DRAW_FG, None));
         }
     } else if y0 == y1 {
         let (left, right) = (x0.min(x1), x0.max(x1));
         for x in left..=right {
-            out.set(x, y0, Cell::new("─", DRAW_FG, DRAW_BG));
+            out.set(x, y0, Cell::new("─", DRAW_FG, None));
         }
     }
     // Non-axis-aligned pairs never reach here (legs always share an axis).
@@ -200,7 +201,7 @@ pub fn draw_line(x0: i32, y0: i32, x1: i32, y1: i32, horizontal_first: bool) -> 
     draw_straight_into(&mut out, x0, y0, bx, by);
     draw_straight_into(&mut out, bx, by, x1, y1);
     let corner = line_corner_for(horizontal_first, x1 - x0, y1 - y0);
-    out.set(bx, by, Cell::new(corner, DRAW_FG, DRAW_BG));
+    out.set(bx, by, Cell::new(corner, DRAW_FG, None));
     out
 }
 
@@ -227,23 +228,11 @@ fn round_away_from_center(v: f64, center: f64) -> i32 {
     }
 }
 
-/// Draw an oval outline patch for a normalized [`Rect`] (tools-spec §5).
-///
-/// - 0-size → empty. 1×1 → single `─` (line-dot convention, §5 step 2).
-/// - 1-wide column → vertical `│` run; 1-high row → horizontal `─` run.
-/// - Otherwise: float-center ellipse (`cx = (l+r)/2`, etc., so odd sizes
-///   center on a cell and even sizes straddle a grid line), rasterized by
-///   dense parametric sampling **plus** per-row/per-column analytic solves,
-///   mirrored explicitly for exact symmetry, deduped. Halves round
-///   away-from-center so left/right (and top/bottom) mirrors match.
-/// - Glyph per cell by local slope: `|dy/dx| <= 1` → `─`, else `│`
-///   (axis extremes fall out; ties go horizontal so 2×2 is all `─`).
-///   No corners, no snap.
-/// Outline coordinates for a plain rectangle (the Rect tool): perimeter
-/// cells for a normalized [`Rect`], drawn with the caller's pencil char
-/// instead of a fixed glyph set like [`draw_box`]. Degenerate inputs give
-/// the single cell (1x1), the row (Nx1) or the column (1xN); empty rects
-/// give no cells.
+/// Outline coordinates for a plain rectangle for the Rect tool. Returns the
+/// perimeter cells of a normalized [`Rect`] to paint with the caller's
+/// pencil char instead of a fixed glyph set like [`draw_box`]. Degenerate
+/// inputs yield just the single cell, row, or column, and empty rects
+/// yield no cells.
 pub fn rect_cells(r: Rect) -> Vec<(i32, i32)> {
     if r.w == 0 || r.h == 0 {
         return Vec::new();
@@ -357,6 +346,18 @@ pub fn ellipse_cells(r: Rect) -> Vec<(i32, i32)> {
     out
 }
 
+/// Draw an oval outline patch for a normalized [`Rect`] (tools-spec §5).
+///
+/// - 0-size → empty. 1×1 → single `─` (line-dot convention, §5 step 2).
+/// - 1-wide column → vertical `│` run; 1-high row → horizontal `─` run.
+/// - Otherwise: float-center ellipse (`cx = (l+r)/2`, etc., so odd sizes
+///   center on a cell and even sizes straddle a grid line), rasterized by
+///   dense parametric sampling **plus** per-row/per-column analytic solves,
+///   mirrored explicitly for exact symmetry, deduped. Halves round
+///   away-from-center so left/right (and top/bottom) mirrors match.
+/// - Glyph per cell by local slope: `|dy/dx| <= 1` → `─`, else `│`
+///   (axis extremes fall out; ties go horizontal so 2×2 is all `─`).
+///   No corners, no snap.
 pub fn draw_ellipse(r: Rect) -> Layer {
     let mut out = Layer::new();
     if r.w == 0 || r.h == 0 {
@@ -364,18 +365,18 @@ pub fn draw_ellipse(r: Rect) -> Layer {
     }
     // w/h >= 1 here.
     if r.w == 1 && r.h == 1 {
-        out.set(r.x, r.y, Cell::new("─", DRAW_FG, DRAW_BG));
+        out.set(r.x, r.y, Cell::new("─", DRAW_FG, None));
         return out;
     }
     if r.w == 1 {
         for y in r.y..=r.y + r.h as i32 - 1 {
-            out.set(r.x, y, Cell::new("│", DRAW_FG, DRAW_BG));
+            out.set(r.x, y, Cell::new("│", DRAW_FG, None));
         }
         return out;
     }
     if r.h == 1 {
         for x in r.x..=r.x + r.w as i32 - 1 {
-            out.set(x, r.y, Cell::new("─", DRAW_FG, DRAW_BG));
+            out.set(x, r.y, Cell::new("─", DRAW_FG, None));
         }
         return out;
     }
@@ -401,7 +402,7 @@ pub fn draw_ellipse(r: Rect) -> Layer {
             (ry * ry * adx) / (rx * rx * ady)
         };
         let ch = if slope <= 1.0 { "─" } else { "│" };
-        out.set(x, y, Cell::new(ch, DRAW_FG, DRAW_BG));
+        out.set(x, y, Cell::new(ch, DRAW_FG, None));
     }
     out
 }
@@ -412,7 +413,12 @@ pub fn draw_ellipse(r: Rect) -> Layer {
 /// box-drawing chars are stored verbatim. Transparent spellings (`""`,
 /// `" "`, `"\0"`) become [`Cell::erased`] (eraser dabs); everything else is
 /// `Cell::new(ch, fg, bg)`.
-pub fn paint_cells(cells: &[(i32, i32)], ch: &str, fg: i8, bg: i8) -> Layer {
+pub fn paint_cells(
+    cells: &[(i32, i32)],
+    ch: &str,
+    fg: PaintColor,
+    bg: Option<PaintColor>,
+) -> Layer {
     let mut out = Layer::new();
     let erased = ch.is_empty() || ch == " " || ch == "\0";
     for (x, y) in cells.iter().copied() {
@@ -995,7 +1001,7 @@ mod tests {
         let mut hist = History::new();
         let mut base = Layer::new();
         for x in 0..=2 {
-            base.set(x, 0, Cell::new("─", 7, -1));
+            base.set(x, 0, Cell::new("─", PaintColor::Ansi(7), None));
         }
         assert!(hist.commit_layer(&mut doc, 0, &base, None));
 
@@ -1016,7 +1022,7 @@ mod tests {
         let mut h2 = History::new();
         let mut col = Layer::new();
         for y in 0..=2 {
-            col.set(0, y, Cell::new("│", 7, -1));
+            col.set(0, y, Cell::new("│", PaintColor::Ansi(7), None));
         }
         assert!(h2.commit_layer(&mut doc2, 0, &col, None));
         let mut s2 = draw_line(-2, 1, 0, 1, true);
@@ -1042,15 +1048,15 @@ mod tests {
         doc.set_active(0);
         let mut hist = History::new();
         let mut cross = Layer::new();
-        cross.set(1, 1, Cell::new("┼", 7, -1));
-        cross.set(0, 1, Cell::new("─", 7, -1));
-        cross.set(2, 1, Cell::new("─", 7, -1));
-        cross.set(1, 0, Cell::new("│", 7, -1));
-        cross.set(1, 2, Cell::new("│", 7, -1));
+        cross.set(1, 1, Cell::new("┼", PaintColor::Ansi(7), None));
+        cross.set(0, 1, Cell::new("─", PaintColor::Ansi(7), None));
+        cross.set(2, 1, Cell::new("─", PaintColor::Ansi(7), None));
+        cross.set(1, 0, Cell::new("│", PaintColor::Ansi(7), None));
+        cross.set(1, 2, Cell::new("│", PaintColor::Ansi(7), None));
         assert!(hist.commit_layer(&mut doc, 0, &cross, None));
 
         // Eraser scratch deletes (2,1) (right arm).
-        let mut scratch = paint_cells(&[(2, 1)], "", 0, -1);
+        let mut scratch = paint_cells(&[(2, 1)], "", PaintColor::Ansi(0), None);
         snap_patch(&doc, 0, &mut scratch);
         // Neighbour (1,1) must lose RIGHT: ┼ → ┤.
         assert_eq!(ch(&scratch, 1, 1).as_deref(), Some("┤"));
@@ -1065,12 +1071,12 @@ mod tests {
     #[test]
     fn pencil_is_raw_no_normalization() {
         // paint_cells stores verbatim even when a junction would form.
-        let dab = paint_cells(&[(0, 0)], "─", 3, -1);
+        let dab = paint_cells(&[(0, 0)], "─", PaintColor::Ansi(3), None);
         assert_eq!(ch(&dab, 0, 0).as_deref(), Some("─"));
-        assert_eq!(dab.get(0, 0).map(|c| (c.fg, c.bg)), Some((3, -1)));
+        assert_eq!(dab.get(0, 0).map(|c| (c.fg, c.bg)), Some((PaintColor::Ansi(3), None)));
         // Eraser spellings become Cell::erased markers (transparent).
         for spelling in ["", " "] {
-            let e = paint_cells(&[(1, 1)], spelling, 0, -1);
+            let e = paint_cells(&[(1, 1)], spelling, PaintColor::Ansi(0), None);
             assert_eq!(e.get(1, 1), None, "eraser {spelling:?} composes empty");
             // Raw entry exists as a deletion marker.
             assert!(!e.is_empty());
@@ -1078,7 +1084,7 @@ mod tests {
         }
         // A pencil box char next to a line does NOT auto-junction on its own:
         // the patch holds exactly the requested cells, nothing more.
-        let two = paint_cells(&[(5, 5), (6, 5)], "─", 7, -1);
+        let two = paint_cells(&[(5, 5), (6, 5)], "─", PaintColor::Ansi(7), None);
         assert_eq!(two.len(), 2);
         assert_eq!(ch(&two, 5, 5).as_deref(), Some("─"));
     }
@@ -1088,9 +1094,9 @@ mod tests {
         let mut doc = Document::new("s", 20, 10);
         let mut hist = History::new();
         let mut base = Layer::new();
-        base.set(1, 1, Cell::new("►", 7, -1));
-        base.set(3, 1, Cell::new("A", 7, -1));
-        base.set(5, 1, Cell::new("━", 7, -1)); // heavy: no junction
+        base.set(1, 1, Cell::new("►", PaintColor::Ansi(7), None));
+        base.set(3, 1, Cell::new("A", PaintColor::Ansi(7), None));
+        base.set(5, 1, Cell::new("━", PaintColor::Ansi(7), None)); // heavy: no junction
         assert!(hist.commit_layer(&mut doc, 0, &base, None));
 
         let mut scratch = draw_line(1, 0, 1, 2, false);

@@ -53,16 +53,18 @@
                   "description": "One character (a base char plus at most one combining mark / variation selector). Null and space are never stored: they are transparent."
                 },
                 "fg": {
-                  "type": "integer",
-                  "minimum": 0,
-                  "maximum": 15,
-                  "description": "Foreground color: Omarchy ANSI index color0-color15."
+                  "anyOf": [
+                    {"type": "integer", "minimum": 0, "maximum": 15},
+                    {"type": "string", "pattern": "^#[0-9a-fA-F]{6}$"}
+                  ],
+                  "description": "Foreground color: an Omarchy ANSI slot 0-15 (color0-color15, live: follows the active theme) or a frozen truecolor hex \"#rrggbb\" (bonus palettes: Pico-8, Picotron)."
                 },
                 "bg": {
-                  "type": "integer",
-                  "minimum": -1,
-                  "maximum": 15,
-                  "description": "Background color: 0-15, or -1 = transparent."
+                  "anyOf": [
+                    {"type": "integer", "minimum": -1, "maximum": 15},
+                    {"type": "string", "pattern": "^#[0-9a-fA-F]{6}$"}
+                  ],
+                  "description": "Background color: 0-15, or -1 = transparent (no background paint); or a frozen truecolor hex \"#rrggbb\"."
                 }
               }
             }

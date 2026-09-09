@@ -6,11 +6,21 @@
 //! have a single import point). Tinting (`draw_*` placeholders → fg/bg pots)
 //! and the [`box_style_next`]/[`box_style_label`] helpers live here because
 //! the `draw` module intentionally carries no color/pot state.
+//!
+//! Paint pots are truecolor-capable: [`App::fg`] is a [`PaintColor`]
+//! (default `Ansi(7)`), [`App::bg`] is an optional [`PaintColor`] (`None` =
+//! transparent, shown as `"-"` in status labels).
+//!
+//! File picking goes through the [`FileDialog`] state machine (no inline
+//! path prompts anywhere): `ui.rs` renders `app.file_dialog` when `Some`,
+//! and `main.rs` forwards dialog keys/mouse to the `dialog_*` delegates.
 
 use std::path::PathBuf;
+use std::time::SystemTime;
 
+use omaframe::chars;
 use omaframe::draw;
-use omaframe::model::{Cell, Document, History, Layer, Rect};
+use omaframe::model::{Cell, Document, History, Layer, PaintColor, Rect};
 use unicode_width::UnicodeWidthStr;
 
 /// Cycle light → heavy → double → rounded → ascii (`L` key).
@@ -50,10 +60,6 @@ pub const PALETTE_TABS: [&str; 7] = [
     "Widgets",
 ];
 
-/// Colors panel rows: row 0 is transparent-background, rows 1–16 are ANSI
-/// slots 0–15.
-pub const COLOR_ROWS: usize = 17;
-
 /// Stable lowercase tab ids (persisted in config / per-file `paletteTab`).
 pub const PALETTE_TAB_IDS: [&str; 7] = [
     "letters",
@@ -89,8 +95,9 @@ fn nerd_glyphs() -> Vec<String> {
     out
 }
 
-/// Exact v1 seed lists per `docs/palette-spec.md` §2. Widgets tab holds stamp
-/// names (multi-char); every other tab holds single chars.
+/// Palette contents per tab. Letters/numbers/nerds/widgets are seeded here;
+/// symbols/outlines/blocks come from the sibling `omaframe::chars` module
+/// (single chars; widgets tab holds multi-char stamp names).
 pub fn palette_chars(tab: usize) -> Vec<String> {
     match tab % 7 {
         0 => ('A'..='Z')
@@ -98,29 +105,9 @@ pub fn palette_chars(tab: usize) -> Vec<String> {
             .map(|c| c.to_string())
             .collect(),
         1 => ('0'..='9').map(|c| c.to_string()).collect(),
-        2 => [
-            '!', '"', '#', '$', '%', '&', '\'', '(', ')', '*', '+', ',', '-', '.',
-            '/', ':', ';', '<', '=', '>', '?', '@', '[', '\\', ']', '^', '_', '`',
-            '{', '|', '}', '~',
-        ]
-        .iter()
-        .map(|c| c.to_string())
-        .collect(),
-        3 => [
-            "─", "│", "┌", "┐", "└", "┘", "├", "┤", "┬", "┴", "┼", "╭", "╮",
-            "╯", "╰", "━", "┃", "═", "║", "╔", "╗", "╱", "╲", "╳", "+", "-",
-            "|",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect(),
-        4 => [
-            "█", "▓", "▒", "░", "▀", "▄", "▌", "▐", "▖", "▗", "▘", "▝", "▚",
-            "▞", "▟", "▁", "▂", "▃", "▅", "▆", "▇",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect(),
+        2 => chars::symbols_tab(),
+        3 => chars::outlines_tab(),
+        4 => chars::blocks_tab(),
         5 => nerd_glyphs(),
         _ => [
             "button",
@@ -230,21 +217,339 @@ impl Tool {
     }
 }
 
-/// Inline path prompt in the status bar (menu Load / Save As).
+// ---------------------------------------------------------------------------
+// File dialog (modal Open / Save picker; no inline path prompts)
+// ---------------------------------------------------------------------------
+
+/// What the dialog returns on confirm: a file to open, or a folder+name to
+/// save under.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum PromptKind {
+pub enum DialogMode {
+    Open,
+    Save,
+}
+
+/// Why the dialog was opened: loading replaces the document, SaveNew starts
+/// a fresh bound document, SaveAs re-binds the current document.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DialogPurpose {
     Load,
+    SaveNew,
     SaveAs,
 }
 
-impl PromptKind {
-    pub fn caption(self) -> &'static str {
-        match self {
-            PromptKind::Load => "Load",
-            PromptKind::SaveAs => "Save as",
+/// One row in the dialog file list.
+pub struct DirEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub modified: String,
+}
+
+/// Modal file picker state. `ui.rs` renders it whenever
+/// `App::file_dialog` is `Some`; `main.rs` forwards dialog keys/mouse to
+/// the `App::dialog_*` delegates and commits/cancels via
+/// [`App::dialog_confirm`] / [`App::dialog_cancel`].
+pub struct FileDialog {
+    pub mode: DialogMode,
+    pub purpose: DialogPurpose,
+    pub cwd: PathBuf,
+    pub entries: Vec<DirEntry>,
+    pub selected: Option<usize>,
+    pub filename: String,
+    /// `(label, icon, path)` sidebar shortcuts: existing dirs among
+    /// Home, Documents, Downloads, Music, Pictures, Videos, plus Root.
+    pub sidebar: Vec<(String, String, PathBuf)>,
+}
+
+/// `(folder, file)` nerd glyphs for the dialog rows, parsed from
+/// `assets/nerd.txt` (first entries whose name contains "folder"/"file").
+/// ASCII fallbacks (`"D"`/`"F"`) when the parse fails.
+pub fn fs_glyphs() -> (String, String) {
+    const NERD_SRC: &str = include_str!("../assets/nerd.txt");
+    let mut folder: Option<String> = None;
+    let mut file: Option<String> = None;
+    for line in NERD_SRC.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let (Some(glyph), Some(name)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let lname = name.to_ascii_lowercase();
+        if folder.is_none() && lname.contains("folder") {
+            folder = Some(glyph.to_string());
+        }
+        if file.is_none() && lname.contains("file") {
+            file = Some(glyph.to_string());
+        }
+        if folder.is_some() && file.is_some() {
+            break;
+        }
+    }
+    (
+        folder.unwrap_or_else(|| "D".to_string()),
+        file.unwrap_or_else(|| "F".to_string()),
+    )
+}
+
+/// Relative mtime label: `just now`, `5m ago`, `3h ago`, `2d ago`
+/// (future timestamps → `just now`).
+fn rel_time(mtime: SystemTime) -> String {
+    let secs = SystemTime::now()
+        .duration_since(mtime)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if secs < 60 {
+        "just now".to_string()
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
+}
+
+fn default_sidebar() -> Vec<(String, String, PathBuf)> {
+    let (folder_icon, _) = fs_glyphs();
+    let home: Option<PathBuf> = std::env::var("HOME").map(PathBuf::from).ok();
+    let mut out = Vec::new();
+    if let Some(h) = &home {
+        if h.is_dir() {
+            out.push(("Home".to_string(), folder_icon.clone(), h.clone()));
+        }
+    }
+    out.push((
+        "Root".to_string(),
+        folder_icon.clone(),
+        PathBuf::from("/"),
+    ));
+    if let Some(h) = &home {
+        for sub in ["Documents", "Downloads", "Music", "Pictures", "Videos"] {
+            let p = h.join(sub);
+            if p.is_dir() {
+                out.push((sub.to_string(), folder_icon.clone(), p));
+            }
+        }
+    }
+    out
+}
+
+impl FileDialog {
+    /// Build a dialog over `start`: used as-is when it is a directory,
+    /// else its parent (callers pass the file's parent, `~/Documents`, or
+    /// `~` — see [`App::open_load_dialog`] and friends).
+    pub fn new(mode: DialogMode, purpose: DialogPurpose, start: PathBuf) -> Self {
+        let cwd = if start.is_dir() {
+            start
+        } else {
+            start
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or(start)
+        };
+        let mut d = Self {
+            mode,
+            purpose,
+            cwd,
+            entries: Vec::new(),
+            selected: None,
+            filename: String::new(),
+            sidebar: Vec::new(),
+        };
+        d.refresh();
+        d
+    }
+
+    /// Re-read `cwd`: directories first (alpha, case-insensitive), then
+    /// `*.omaframe.json` files (alpha, case-insensitive). Other files are
+    /// hidden. An out-of-range selection resets to `None`; a missing or
+    /// unreadable `cwd` yields an empty list (never panics).
+    pub fn refresh(&mut self) {
+        self.sidebar = default_sidebar();
+        let mut dirs: Vec<DirEntry> = Vec::new();
+        let mut files: Vec<DirEntry> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&self.cwd) {
+            for ent in rd.flatten() {
+                let name = ent.file_name().to_string_lossy().into_owned();
+                let is_dir = ent.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                if is_dir {
+                    dirs.push(DirEntry {
+                        name,
+                        is_dir: true,
+                        size: 0,
+                        modified: ent
+                            .metadata()
+                            .ok()
+                            .and_then(|m| m.modified().ok())
+                            .map(rel_time)
+                            .unwrap_or_default(),
+                    });
+                } else if name.ends_with(".omaframe.json") {
+                    let (size, modified) = ent
+                        .metadata()
+                        .ok()
+                        .map(|m| {
+                            (
+                                m.len(),
+                                m.modified().ok().map(rel_time).unwrap_or_default(),
+                            )
+                        })
+                        .unwrap_or((0, String::new()));
+                    files.push(DirEntry {
+                        name,
+                        is_dir: false,
+                        size,
+                        modified,
+                    });
+                }
+            }
+        }
+        dirs.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+        });
+        files.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+        });
+        dirs.extend(files);
+        self.entries = dirs;
+        if self
+            .selected
+            .is_some_and(|s| s >= self.entries.len())
+        {
+            self.selected = None;
+        }
+    }
+
+    /// Move the highlight by `dir` rows, wrapping around the list. Empty
+    /// list → `None`; no selection yet → first (or last for `dir < 0`).
+    pub fn move_selection(&mut self, dir: i32) {
+        if self.entries.is_empty() {
+            self.selected = None;
+            return;
+        }
+        let n = self.entries.len();
+        let next = match self.selected {
+            None => {
+                if dir < 0 {
+                    n - 1
+                } else {
+                    0
+                }
+            }
+            Some(s) => (s as i32 + dir).rem_euclid(n as i32) as usize,
+        };
+        self.selected = Some(next);
+    }
+
+    /// Descend into the selected directory (selection resets). No-op when
+    /// nothing or a file is selected.
+    pub fn enter_selected(&mut self) {
+        let Some(s) = self.selected else { return };
+        let Some(e) = self.entries.get(s) else { return };
+        if !e.is_dir {
+            return;
+        }
+        self.cwd = self.cwd.join(&e.name);
+        self.refresh();
+        self.selected = None;
+    }
+
+    /// Go to the parent directory (selection resets). No-op at the root.
+    pub fn go_up(&mut self) {
+        if let Some(p) = self.cwd.parent().map(|p| p.to_path_buf()) {
+            self.cwd = p;
+            self.refresh();
+            self.selected = None;
+        }
+    }
+
+    /// Jump to `path`: directories become `cwd`; a file path jumps to its
+    /// parent and selects the file when it is listed.
+    pub fn goto(&mut self, path: PathBuf) {
+        if path.is_dir() {
+            self.cwd = path;
+            self.refresh();
+            self.selected = None;
+        } else if let Some(parent) = path.parent().map(|p| p.to_path_buf()) {
+            if parent.is_dir() {
+                let name = path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned());
+                self.cwd = parent;
+                self.refresh();
+                self.selected = name
+                    .and_then(|n| {
+                        self.entries
+                            .iter()
+                            .position(|e| !e.is_dir && e.name == n)
+                    });
+            }
+        }
+    }
+
+    /// Type into the Save filename box (control chars ignored).
+    pub fn type_char(&mut self, c: char) {
+        if !c.is_control() {
+            self.filename.push(c);
+        }
+    }
+
+    /// Delete the last filename char.
+    pub fn backspace(&mut self) {
+        self.filename.pop();
+    }
+
+    /// Create `New Folder` / `New Folder 2` / …, then refresh and select it.
+    pub fn make_folder(&mut self) {
+        let mut n = 1u32;
+        let name = loop {
+            let cand = if n == 1 {
+                "New Folder".to_string()
+            } else {
+                format!("New Folder {n}")
+            };
+            if !self.cwd.join(&cand).exists() {
+                break cand;
+            }
+            n += 1;
+        };
+        let _ = std::fs::create_dir(self.cwd.join(&name));
+        self.refresh();
+        self.selected = self
+            .entries
+            .iter()
+            .position(|e| e.is_dir && e.name == name);
+    }
+
+    /// The path to act on, or `None` when there is nothing valid to
+    /// confirm: Open → the selected file (dirs / empty selection → `None`);
+    /// Save → `cwd/filename` when the filename is non-blank.
+    pub fn confirm_path(&self) -> Option<PathBuf> {
+        match self.mode {
+            DialogMode::Open => self
+                .selected
+                .and_then(|s| self.entries.get(s))
+                .filter(|e| !e.is_dir)
+                .map(|e| self.cwd.join(&e.name)),
+            DialogMode::Save => {
+                if self.filename.trim().is_empty() {
+                    None
+                } else {
+                    Some(self.cwd.join(&self.filename))
+                }
+            }
         }
     }
 }
+
 /// Interactive state. `doc` + `history` are the source of truth; `scratch`
 /// is the live gesture preview rendered above the stack and committed on
 /// release (tools-spec §0).
@@ -254,8 +559,8 @@ pub struct App {
     pub scratch: Layer,
     pub tool: Tool,
     pub ch: String,
-    pub fg: i8,
-    pub bg: i8,
+    pub fg: PaintColor,
+    pub bg: Option<PaintColor>,
     pub box_style: draw::BoxStyle,
     pub arrow: bool,
     pub cursor: (i32, i32),
@@ -264,8 +569,7 @@ pub struct App {
     pub palette_scroll: usize,
     pub colors_scroll: usize,
     pub preview_dark: bool,
-    pub prompt: Option<PromptKind>,
-    pub prompt_buf: String,
+    pub file_dialog: Option<FileDialog>,
     pub status_msg: String,
     pub text_buffer: String,
     // --- session state (not in the brief's field list, but required) ---
@@ -288,8 +592,8 @@ impl App {
             scratch: Layer::new(),
             tool: Tool::Pencil,
             ch: "─".to_string(),
-            fg: 7,
-            bg: -1,
+            fg: PaintColor::Ansi(7),
+            bg: None,
             box_style: draw::BoxStyle::Light,
             arrow: false,
             cursor: (0, 0),
@@ -298,8 +602,7 @@ impl App {
             palette_scroll: 0,
             colors_scroll: 0,
             preview_dark,
-            prompt: None,
-            prompt_buf: String::new(),
+            file_dialog: None,
             status_msg: "click-drag draws · wheel scrolls · middle-drag pans · right-click grabs · Ctrl-S saves"
                 .to_string(),
             text_buffer: String::new(),
@@ -347,6 +650,24 @@ impl App {
                 if self.dirty { "*" } else { "" }
             ),
             None => format!("untitled{}", if self.dirty { "*" } else { "" }),
+        }
+    }
+
+    /// Foreground pot label for the status bar (`Ansi` → slot index,
+    /// `Rgb` → `#rrggbb`).
+    pub fn fg_label(&self) -> String {
+        match self.fg {
+            PaintColor::Ansi(i) => i.to_string(),
+            rgb => rgb.to_hex(),
+        }
+    }
+
+    /// Background pot label for the status bar (`None` → `"-"`).
+    pub fn bg_label(&self) -> String {
+        match self.bg {
+            None => "-".to_string(),
+            Some(PaintColor::Ansi(i)) => i.to_string(),
+            Some(rgb) => rgb.to_hex(),
         }
     }
 
@@ -469,27 +790,27 @@ impl App {
         });
     }
 
+    /// Cycle the foreground pot through ANSI slots 0–15 (a truecolor pot
+    /// resets into the ANSI cycle at 0).
     pub fn cycle_fg(&mut self) {
-        self.fg = (self.fg + 1).rem_euclid(16);
-        self.set_status(format!("fg: {}", self.fg));
+        let next = match self.fg {
+            PaintColor::Ansi(i) => (i + 1) % 16,
+            PaintColor::Rgb(..) => 0,
+        };
+        self.fg = PaintColor::Ansi(next);
+        self.set_status(format!("fg: {}", self.fg_label()));
     }
 
+    /// Cycle the background pot `None → Ansi(0..15) → None` (a truecolor
+    /// pot steps to `None`, the end of the cycle).
     pub fn cycle_bg(&mut self) {
-        self.bg = if self.bg < 0 {
-            0
-        } else if self.bg >= 15 {
-            -1
-        } else {
-            self.bg + 1
+        self.bg = match self.bg {
+            None => Some(PaintColor::Ansi(0)),
+            Some(PaintColor::Ansi(i)) if i >= 15 => None,
+            Some(PaintColor::Ansi(i)) => Some(PaintColor::Ansi(i + 1)),
+            Some(PaintColor::Rgb(..)) => None,
         };
-        self.set_status(format!(
-            "bg: {}",
-            if self.bg < 0 {
-                "-".to_string()
-            } else {
-                self.bg.to_string()
-            }
-        ));
+        self.set_status(format!("bg: {}", self.bg_label()));
     }
 
     pub fn set_tool(&mut self, t: Tool) {
@@ -546,6 +867,7 @@ impl App {
     pub fn undo(&mut self) {
         if self.history.undo(&mut self.doc) {
             self.dirty = true;
+            self.autosave();
             self.set_status("undo");
         } else {
             self.set_status("nothing to undo");
@@ -555,15 +877,18 @@ impl App {
     pub fn redo(&mut self) {
         if self.history.redo(&mut self.doc) {
             self.dirty = true;
+            self.autosave();
             self.set_status("redo");
         } else {
             self.set_status("nothing to redo");
         }
     }
 
+    /// Explicit save (Ctrl-S): writes to the bound path, or opens a SaveAs
+    /// dialog when pathless (returns false in that case).
     pub fn save(&mut self) -> bool {
         let Some(path) = self.file_path.clone() else {
-            self.set_status("no file path — run as `omaframe [FILE]`");
+            self.open_save_as_dialog();
             return false;
         };
         match omaframe::model::save_file(&self.doc, &path) {
@@ -587,37 +912,28 @@ impl App {
 
     // --- colors panel (direct fg/bg pots) ---
 
-    /// Set the foreground pot (left-click a swatch).
-    pub fn set_fg(&mut self, idx: i8) {
-        if (0..16).contains(&idx) {
-            self.fg = idx;
-            self.set_status(format!("fg: {idx}"));
-        }
+    /// Set the foreground pot (left-click a swatch, or a truecolor pick).
+    pub fn set_fg(&mut self, fg: PaintColor) {
+        self.fg = fg;
+        self.set_status(format!("fg: {}", self.fg_label()));
     }
 
-    /// Set the background pot (right-click a swatch). `-1` = transparent.
-    pub fn set_bg(&mut self, idx: i8) {
-        if (-1..16).contains(&idx) {
-            self.bg = idx;
-            self.set_status(format!(
-                "bg: {}",
-                if idx < 0 {
-                    "-".to_string()
-                } else {
-                    idx.to_string()
-                }
-            ));
-        }
+    /// Set the background pot (right-click a swatch). `None` = transparent.
+    pub fn set_bg(&mut self, bg: Option<PaintColor>) {
+        self.bg = bg;
+        self.set_status(format!("bg: {}", self.bg_label()));
     }
 
-    /// Scroll the colors list; `visible` is the rows on screen.
-    pub fn scroll_colors(&mut self, dir: i32, visible: usize) {
-        let max = COLOR_ROWS.saturating_sub(visible.max(1));
+    /// Scroll the colors list by `dir` rows. `total_rows` is the full row
+    /// count (ANSI slots + group headers + bonus palettes — the caller
+    /// computes it); `visible` is the rows on screen.
+    pub fn scroll_colors(&mut self, dir: i32, total_rows: usize, visible: usize) {
+        let max = total_rows.saturating_sub(visible.max(1));
         let next = self.colors_scroll as i32 + dir;
         self.colors_scroll = next.clamp(0, max as i32) as usize;
     }
 
-    // --- menu file ops + path prompt ---
+    // --- menu file ops + file dialog ---
 
     /// Expand `~` and relative paths against the current directory.
     pub fn expand_path(raw: &str) -> PathBuf {
@@ -630,7 +946,7 @@ impl App {
         PathBuf::from(s)
     }
 
-    fn doc_name_for(path: &PathBuf) -> String {
+    fn doc_name_for(path: &std::path::Path) -> String {
         path.file_stem()
             .and_then(|s| s.to_str())
             .filter(|s| !s.is_empty())
@@ -638,27 +954,89 @@ impl App {
             .to_string()
     }
 
+    /// Dialog start dir: the bound file's parent, else `~/Documents` when it
+    /// exists, else `~` (else the process cwd).
+    fn dialog_start_dir(&self) -> PathBuf {
+        if let Some(p) = &self.file_path {
+            if let Some(parent) = p.parent() {
+                if !parent.as_os_str().is_empty() {
+                    return parent.to_path_buf();
+                }
+            }
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let docs = PathBuf::from(&home).join("Documents");
+            if docs.is_dir() {
+                return docs;
+            }
+            return PathBuf::from(home);
+        }
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    }
+
+    fn save_dialog_filename(&self) -> String {
+        format!("{}.omaframe.json", self.doc.name)
+    }
+
+    /// Menu → Load: open the Load dialog over the start dir.
+    pub fn open_load_dialog(&mut self) {
+        let start = self.dialog_start_dir();
+        self.file_dialog = Some(FileDialog::new(
+            DialogMode::Open,
+            DialogPurpose::Load,
+            start,
+        ));
+        self.set_status("load: pick a .omaframe.json file");
+    }
+
+    /// Open the SaveNew dialog (fresh bound file at the confirmed path).
+    pub fn open_save_new_dialog(&mut self) {
+        let start = self.dialog_start_dir();
+        let mut d = FileDialog::new(DialogMode::Save, DialogPurpose::SaveNew, start);
+        d.filename = self.save_dialog_filename();
+        self.file_dialog = Some(d);
+        self.set_status("new file: pick a folder + name");
+    }
+
+    /// Open the SaveAs dialog (re-bind the current document on confirm).
+    fn open_save_as_dialog(&mut self) {
+        let start = self.dialog_start_dir();
+        let mut d = FileDialog::new(DialogMode::Save, DialogPurpose::SaveAs, start);
+        d.filename = self.save_dialog_filename();
+        self.file_dialog = Some(d);
+        self.set_status("save as: pick a folder + name");
+    }
+
     /// Menu → New: keeps the file path slot (save first if dirty), starts a
     /// fresh 80×24 canvas.
-    pub fn new_file(&mut self) {
+    pub fn new_file_to(&mut self, path: PathBuf) -> bool {
         self.autosave();
-        let name = match &self.file_path {
-            Some(p) => Self::doc_name_for(p),
-            None => "untitled".to_string(),
-        };
-        self.doc = Document::new(name, 80, 24);
+        self.doc = Document::new(Self::doc_name_for(&path), 80, 24);
+        self.preview_dark = self.doc.preview_dark;
+        self.palette_tab = palette_tab_index(&self.doc.palette_tab);
         self.history = History::new();
         self.scratch.clear();
         self.cursor = (0, 0);
         self.viewport = (0, 0);
-        self.dirty = false;
-        self.set_status("new canvas (80x24, infinite scroll)");
+        self.palette_scroll = 0;
+        self.file_path = Some(path.clone());
+        match omaframe::model::save_file(&self.doc, &path) {
+            Ok(()) => {
+                self.dirty = false;
+                self.set_status(format!("created {}", path.display()));
+                true
+            }
+            Err(e) => {
+                self.dirty = true;
+                self.set_status(format!("save failed: {e}"));
+                false
+            }
+        }
     }
 
-    /// Menu → Load (or prompt confirm): replaces the document on success,
+    /// Menu → Load / dialog Load confirm: replaces the document on success,
     /// keeps the old one + status on failure.
-    pub fn load_path(&mut self, raw: &str) -> bool {
-        let path = Self::expand_path(raw);
+    pub fn load_file_path(&mut self, path: PathBuf) -> bool {
         match omaframe::model::load_file(&path) {
             Ok(doc) => {
                 self.preview_dark = doc.preview_dark;
@@ -681,9 +1059,8 @@ impl App {
         }
     }
 
-    /// Save under a new path (menu Save with no path, or Save As prompt).
-    pub fn save_as(&mut self, raw: &str) -> bool {
-        let path = Self::expand_path(raw);
+    /// Save under a new path (dialog SaveAs confirm).
+    pub fn save_as_path(&mut self, path: PathBuf) -> bool {
         match omaframe::model::save_file(&self.doc, &path) {
             Ok(()) => {
                 self.file_path = Some(path.clone());
@@ -698,55 +1075,109 @@ impl App {
         }
     }
 
-    /// Menu → Save: normal save, or a Save As prompt when pathless.
+    /// Menu → Save: normal save, or a SaveAs dialog when pathless.
     pub fn menu_save(&mut self) {
         if self.file_path.is_some() {
             self.save();
         } else {
-            self.start_prompt(PromptKind::SaveAs);
+            self.open_save_as_dialog();
         }
     }
 
-    // --- inline path prompt ---
-
-    pub fn start_prompt(&mut self, kind: PromptKind) {
-        self.prompt = Some(kind);
-        self.prompt_buf.clear();
-    }
-
-    pub fn prompt_push(&mut self, c: char) {
-        if self.prompt.is_some() && !c.is_control() {
-            self.prompt_buf.push(c);
+    /// Confirm the open dialog: Load → [`App::load_file_path`], SaveNew →
+    /// [`App::new_file_to`], SaveAs → [`App::save_as_path`]. Closes the
+    /// dialog + autosaves on success; on failure (or nothing confirmable)
+    /// sets a status and stays open.
+    pub fn dialog_confirm(&mut self) {
+        let Some(dlg) = self.file_dialog.as_ref() else {
+            return;
+        };
+        let purpose = dlg.purpose;
+        let Some(path) = dlg.confirm_path() else {
+            self.set_status(match purpose {
+                DialogPurpose::Load => "load: select a file",
+                _ => "save: enter a file name",
+            });
+            return;
+        };
+        let ok = match purpose {
+            DialogPurpose::Load => self.load_file_path(path),
+            DialogPurpose::SaveNew => self.new_file_to(path),
+            DialogPurpose::SaveAs => self.save_as_path(path),
+        };
+        if ok {
+            self.file_dialog = None;
+            self.autosave();
         }
     }
 
-    pub fn prompt_backspace(&mut self) {
-        self.prompt_buf.pop();
-    }
-
-    pub fn cancel_prompt(&mut self) {
-        self.prompt = None;
-        self.prompt_buf.clear();
+    /// Dismiss the open dialog (no action).
+    pub fn dialog_cancel(&mut self) {
+        self.file_dialog = None;
         self.set_status("cancelled");
     }
 
-    /// Enter: run the prompt action, keep it open on failure.
-    pub fn confirm_prompt(&mut self) {
-        let (kind, buf) = match (self.prompt, self.prompt_buf.clone()) {
-            (Some(k), b) => (k, b),
-            _ => return,
-        };
-        if buf.trim().is_empty() {
-            self.cancel_prompt();
-            return;
+    /// Dialog delegate: move the file highlight by `dir` rows.
+    pub fn dialog_move_selection(&mut self, dir: i32) {
+        if let Some(d) = self.file_dialog.as_mut() {
+            d.move_selection(dir);
         }
-        let ok = match kind {
-            PromptKind::Load => self.load_path(&buf),
-            PromptKind::SaveAs => self.save_as(&buf),
+    }
+
+    /// Dialog delegate: type into the Save filename box.
+    pub fn dialog_type(&mut self, c: char) {
+        if let Some(d) = self.file_dialog.as_mut() {
+            d.type_char(c);
+        }
+    }
+
+    /// Dialog delegate: filename backspace.
+    pub fn dialog_backspace(&mut self) {
+        if let Some(d) = self.file_dialog.as_mut() {
+            d.backspace();
+        }
+    }
+
+    /// Dialog delegate: descend into the selected folder; when a FILE is
+    /// selected in Open mode, confirm immediately.
+    pub fn dialog_enter(&mut self) {
+        let confirm_now = match self.file_dialog.as_mut() {
+            Some(d) => {
+                d.enter_selected();
+                d.mode == DialogMode::Open && d.confirm_path().is_some()
+            }
+            None => return,
         };
-        if ok {
-            self.prompt = None;
-            self.prompt_buf.clear();
+        if confirm_now {
+            self.dialog_confirm();
+        }
+    }
+
+    /// Dialog delegate: go to the parent directory.
+    pub fn dialog_up(&mut self) {
+        if let Some(d) = self.file_dialog.as_mut() {
+            d.go_up();
+        }
+    }
+
+    /// Dialog delegate: jump to sidebar entry `i` (no-op when out of range).
+    pub fn dialog_goto_sidebar(&mut self, i: usize) {
+        let path = self
+            .file_dialog
+            .as_ref()
+            .and_then(|d| d.sidebar.get(i))
+            .map(|(_, _, p)| p.clone());
+        if let Some(p) = path {
+            if let Some(d) = self.file_dialog.as_mut() {
+                d.goto(p);
+            }
+        }
+    }
+
+    /// Dialog delegate: create `New Folder…` and select it.
+    pub fn dialog_make_folder(&mut self) {
+        if let Some(d) = self.file_dialog.as_mut() {
+            d.make_folder();
         }
     }
 
@@ -785,8 +1216,8 @@ impl App {
         }
     }
 
-    /// Recolor a `draw_*` patch (placeholder `DRAW_FG`/`DRAW_BG`) to the
-    /// fg/bg pots; transparent markers pass through as erasures.
+    /// Recolor a `draw_*` patch (placeholder `DRAW_FG` cells) to the fg/bg
+    /// pots; transparent markers pass through as erasures.
     fn tint(&self, mut layer: Layer) -> Layer {
         if layer.is_empty() {
             return layer;
@@ -987,6 +1418,7 @@ impl App {
                 let patch = std::mem::take(&mut self.scratch);
                 if self.history.commit(&mut self.doc, &patch) {
                     self.dirty = true;
+                    self.autosave();
                 }
                 self.anchor = None;
                 self.drawing = false;
@@ -1030,7 +1462,7 @@ impl App {
         }
     }
 
-    /// Eyedropper (decisions.md Q4): copy ch+fg+bg into the pencil.
+    /// Eyedropper (decisions.md Q4): copy ch+fg+bg into the pencil, verbatim.
     pub fn grab_at(&mut self, x: i32, y: i32) -> bool {
         let (x, y) = self.resolve_guard(x, y);
         match self.doc.cell(x, y) {
@@ -1041,16 +1473,16 @@ impl App {
                 if self.tool != Tool::Pencil {
                     self.tool = Tool::Pencil;
                 }
-                self.set_status(format!(
-                    "grabbed '{}' fg {} bg {}",
-                    self.ch,
-                    self.fg,
-                    if self.bg < 0 {
-                        "-".to_string()
-                    } else {
-                        self.bg.to_string()
-                    }
-                ));
+                let bg = match self.bg {
+                    None => "-".to_string(),
+                    Some(PaintColor::Ansi(i)) => i.to_string(),
+                    Some(rgb) => rgb.to_hex(),
+                };
+                let fg = match self.fg {
+                    PaintColor::Ansi(i) => i.to_string(),
+                    rgb => rgb.to_hex(),
+                };
+                self.set_status(format!("grabbed '{}' fg {fg} bg {bg}", self.ch));
                 true
             }
             None => {
@@ -1139,6 +1571,7 @@ impl App {
         let patch = std::mem::take(&mut self.scratch);
         if self.history.commit(&mut self.doc, &patch) {
             self.dirty = true;
+            self.autosave();
             self.set_status("text committed");
         }
     }
@@ -1160,6 +1593,7 @@ impl App {
             }
             if self.history.commit(&mut self.doc, &patch) {
                 self.dirty = true;
+                self.autosave();
                 self.set_status("selection cut");
             }
             self.history.clear_selection();
@@ -1169,6 +1603,7 @@ impl App {
         patch.set(self.cursor.0, self.cursor.1, Cell::erased());
         if self.history.commit(&mut self.doc, &patch) {
             self.dirty = true;
+            self.autosave();
             self.set_status("cleared 1 cell");
         }
     }
@@ -1179,7 +1614,11 @@ impl App {
         if self.tool != Tool::Pencil {
             self.tool = Tool::Pencil;
         }
-        self.set_status(format!("ch '{s}' fg {} tab {}", self.fg, PALETTE_TABS[self.palette_tab]));
+        self.set_status(format!(
+            "ch '{s}' fg {} tab {}",
+            self.fg_label(),
+            PALETTE_TABS[self.palette_tab]
+        ));
     }
 
     pub fn active_layer_name(&self) -> &str {
@@ -1202,9 +1641,18 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use omaframe::chars;
 
     fn test_doc() -> Document {
         Document::new("t", 80, 24)
+    }
+
+    /// Unique temp dir per test (pid-tagged; removed at the end).
+    fn tempdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("omaframe-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
     }
 
     #[test]
@@ -1239,7 +1687,7 @@ mod tests {
 
         // Wide-char guard resolves to its anchor.
         let mut patch = Layer::new();
-        patch.set(5, 5, Cell::new("漢", 1, -1));
+        patch.set(5, 5, Cell::new("漢", PaintColor::Ansi(1), None));
         assert!(app.history.commit(&mut app.doc, &patch));
         app.cursor = (6, 5); // continuation guard
         app.clamp_cursor();
@@ -1264,13 +1712,79 @@ mod tests {
         assert_eq!(app.palette_tab, 0);
         app.cycle_palette_tab(-1);
         assert_eq!(app.palette_tab, 6);
-        // Exact seed counts per docs/palette-spec.md.
+        // Letters/numbers stay seeded here; symbols/outlines/blocks come
+        // from the sibling chars module (wiring, not counts).
         assert_eq!(palette_chars(0).len(), 52);
         assert_eq!(palette_chars(1).len(), 10);
-        assert_eq!(palette_chars(2).len(), 32);
-        assert_eq!(palette_chars(3).len(), 27);
-        assert_eq!(palette_chars(4).len(), 21);
+        assert_eq!(palette_chars(2), chars::symbols_tab());
+        assert_eq!(palette_chars(3), chars::outlines_tab());
+        assert_eq!(palette_chars(4), chars::blocks_tab());
+        assert!(!palette_chars(2).is_empty());
+        assert!(!palette_chars(3).is_empty());
+        assert!(!palette_chars(4).is_empty());
         assert!(!palette_chars(5).is_empty()); // nerds from assets/nerd.txt
+    }
+
+    #[test]
+    fn truecolor_pots_cycle_set_and_label() {
+        let mut app = App::new(test_doc(), None);
+        assert_eq!(app.fg, PaintColor::Ansi(7));
+        assert_eq!(app.bg, None);
+        assert_eq!(app.bg_label(), "-");
+        // fg cycles Ansi 0-15 with wraparound.
+        app.cycle_fg();
+        assert_eq!(app.fg, PaintColor::Ansi(8));
+        for _ in 0..7 {
+            app.cycle_fg();
+        }
+        assert_eq!(app.fg, PaintColor::Ansi(15));
+        app.cycle_fg();
+        assert_eq!(app.fg, PaintColor::Ansi(0));
+        // Cycling from a truecolor pot resets into the ANSI cycle.
+        app.set_fg(PaintColor::Rgb(200, 100, 50));
+        assert_eq!(app.fg, PaintColor::Rgb(200, 100, 50));
+        assert_eq!(app.fg_label(), "#c86432");
+        app.cycle_fg();
+        assert_eq!(app.fg, PaintColor::Ansi(0));
+        // bg cycles None → Ansi(0..15) → None.
+        app.cycle_bg();
+        assert_eq!(app.bg, Some(PaintColor::Ansi(0)));
+        for _ in 0..15 {
+            app.cycle_bg();
+        }
+        assert_eq!(app.bg, Some(PaintColor::Ansi(15)));
+        assert_ne!(app.bg_label(), "-");
+        app.cycle_bg();
+        assert_eq!(app.bg, None);
+        assert_eq!(app.bg_label(), "-");
+        // Setters take truecolor verbatim.
+        app.set_fg(PaintColor::Rgb(1, 2, 3));
+        app.set_bg(Some(PaintColor::Rgb(4, 5, 6)));
+        assert_eq!(app.fg, PaintColor::Rgb(1, 2, 3));
+        assert_eq!(app.bg, Some(PaintColor::Rgb(4, 5, 6)));
+        assert_eq!(app.bg_label(), "#040506");
+    }
+
+    #[test]
+    fn tint_maps_placeholders_to_truecolor_pots() {
+        let mut app = App::new(test_doc(), None);
+        app.set_fg(PaintColor::Rgb(10, 20, 30));
+        app.set_bg(Some(PaintColor::Ansi(2)));
+        let mut raw = Layer::new();
+        raw.set(0, 0, Cell::new("─", draw::DRAW_FG, None));
+        raw.set(1, 0, Cell::erased());
+        let tinted = app.tint(raw);
+        assert_eq!(
+            tinted.get(0, 0),
+            Some(Cell::new(
+                "─",
+                PaintColor::Rgb(10, 20, 30),
+                Some(PaintColor::Ansi(2))
+            ))
+        );
+        // Erased markers pass through (compose empty, raw key kept).
+        assert_eq!(tinted.get(1, 0), None);
+        assert!(tinted.keys().any(|k| k == (1, 0)));
     }
 
     #[test]
@@ -1301,7 +1815,7 @@ mod tests {
     fn rect_and_oval_use_palette_char() {
         let mut app = App::new(test_doc(), None);
         app.ch = "#".to_string();
-        app.fg = 2;
+        app.fg = PaintColor::Ansi(2);
         // Rect: plain outline in the palette char, committed as one entry.
         app.set_tool(Tool::Rect);
         app.start_stroke(0, 0, false);
@@ -1310,7 +1824,7 @@ mod tests {
         assert_eq!(app.history.undo_len(), 1);
         let cell = app.doc.cell(0, 0).expect("rect corner");
         assert_eq!(cell.ch, "#");
-        assert_eq!(cell.fg, 2);
+        assert_eq!(cell.fg, PaintColor::Ansi(2));
         assert!(app.doc.cell(1, 1).is_none(), "rect interior empty");
         // Oval: same char discipline (no fixed ─/│).
         app.set_tool(Tool::Oval);
@@ -1330,65 +1844,253 @@ mod tests {
     }
 
     #[test]
-    fn prompt_load_round_trip_and_cancel() {
-        let mut app = App::new(test_doc(), None);
-        // Save the demo doc to a temp path, mutate, then Load it back.
-        let dir = std::env::temp_dir().join("omaframe-prompt-test");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("p.omaframe.json");
-        let demo = include_str!("../testdata/demo.omaframe.json");
-        std::fs::write(&path, demo).unwrap();
-        app.start_prompt(PromptKind::Load);
-        assert_eq!(app.prompt, Some(PromptKind::Load));
-        for c in path.display().to_string().chars() {
-            app.prompt_push(c);
+    fn fs_glyphs_come_from_nerd_txt() {
+        // First "folder"/"file" name hits in assets/nerd.txt.
+        let (folder, file) = fs_glyphs();
+        assert_eq!(folder, "\u{f07b}");
+        assert_eq!(file, "\u{f15b}");
+    }
+
+    #[test]
+    fn dialog_navigation_make_folder_and_confirm_paths() {
+        let root = tempdir("dlg");
+        std::fs::create_dir_all(root.join("sub").join("nested")).unwrap();
+        std::fs::write(root.join("sub").join("a.omaframe.json"), "{}").unwrap();
+        std::fs::write(root.join("b.omaframe.json"), "{}").unwrap();
+        std::fs::write(root.join("ignore.txt"), "x").unwrap();
+
+        // Open dialog over the root: dirs first, then *.omaframe.json files.
+        let mut d = FileDialog::new(DialogMode::Open, DialogPurpose::Load, root.clone());
+        assert_eq!(d.cwd, root);
+        let names: Vec<(&str, bool)> = d
+            .entries
+            .iter()
+            .map(|e| (e.name.as_str(), e.is_dir))
+            .collect();
+        assert_eq!(names, vec![("sub", true), ("b.omaframe.json", false)]);
+        assert!(!d.sidebar.is_empty());
+        assert!(d.sidebar.iter().any(|(l, _, _)| l == "Root"));
+
+        // Selection starts empty; moving selects the first row, enter descends.
+        assert_eq!(d.selected, None);
+        d.move_selection(1);
+        assert_eq!(d.selected, Some(0));
+        d.enter_selected();
+        assert_eq!(d.cwd, root.join("sub"));
+        assert_eq!(d.selected, None);
+        // Back up, then jump straight into a file's parent via goto.
+        d.go_up();
+        assert_eq!(d.cwd, root);
+        d.goto(root.join("sub").join("a.omaframe.json"));
+        assert_eq!(d.cwd, root.join("sub"));
+        assert_eq!(d.selected, Some(1)); // [nested(dir), a.omaframe.json]
+        d.goto(root.clone());
+
+        // make_folder creates New Folder / New Folder 2… and selects each.
+        d.make_folder();
+        assert!(root.join("New Folder").is_dir());
+        assert_eq!(
+            d.selected
+                .and_then(|s| d.entries.get(s))
+                .map(|e| e.name.clone()),
+            Some("New Folder".to_string())
+        );
+        d.make_folder();
+        assert!(root.join("New Folder 2").is_dir());
+        assert_eq!(
+            d.selected
+                .and_then(|s| d.entries.get(s))
+                .map(|e| e.name.clone()),
+            Some("New Folder 2".to_string())
+        );
+
+        // Open confirm: file → full path; dir / nothing → None.
+        d.goto(root.clone());
+        let file_idx = d
+            .entries
+            .iter()
+            .position(|e| !e.is_dir && e.name == "b.omaframe.json")
+            .unwrap();
+        d.selected = Some(file_idx);
+        assert_eq!(d.confirm_path(), Some(root.join("b.omaframe.json")));
+        d.selected = Some(0); // a dir ("New Folder")
+        assert!(d.entries[0].is_dir);
+        assert_eq!(d.confirm_path(), None);
+        d.selected = None;
+        assert_eq!(d.confirm_path(), None);
+
+        // Save confirm: blank filename → None, else cwd/filename.
+        let mut s = FileDialog::new(DialogMode::Save, DialogPurpose::SaveAs, root.clone());
+        assert_eq!(s.confirm_path(), None);
+        for c in "n.omaframe.json".chars() {
+            s.type_char(c);
         }
-        app.confirm_prompt();
-        assert_eq!(app.prompt, None, "prompt closes on success");
-        assert_eq!(app.doc.name, "settings-panel");
-        assert_eq!(app.file_path, Some(path.clone()));
-        // Failure keeps the prompt open with a status message.
-        app.start_prompt(PromptKind::Load);
-        app.prompt_buf = "/nonexistent-dir-xyz/nope.omaframe.json".to_string();
-        app.confirm_prompt();
-        assert_eq!(app.prompt, Some(PromptKind::Load));
-        assert!(app.status_msg.starts_with("load failed"));
-        app.cancel_prompt();
-        assert_eq!(app.prompt, None);
-        // Tilde expansion.
+        assert_eq!(s.filename, "n.omaframe.json");
+        assert_eq!(s.confirm_path(), Some(root.join("n.omaframe.json")));
+        s.backspace();
+        assert_eq!(s.filename, "n.omaframe.jso");
+        s.filename.clear();
+        for c in "   ".chars() {
+            s.type_char(c);
+        }
+        assert_eq!(s.confirm_path(), None, "blank filename confirms nothing");
+
+        // Tilde expansion still works for typed paths.
         let home = std::env::var("HOME").unwrap();
         assert_eq!(
             App::expand_path("~/x/y.json"),
             std::path::PathBuf::from(home).join("x/y.json")
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dialog_save_new_and_load_round_trip() {
+        let root = tempdir("dlg-rt");
+        // SaveNew flow through dialog_confirm: fresh doc bound + saved.
+        let mut app = App::new(test_doc(), None);
+        app.open_save_new_dialog();
+        assert!(app.file_dialog.is_some());
+        assert_eq!(
+            app.file_dialog.as_ref().unwrap().purpose,
+            DialogPurpose::SaveNew
+        );
+        app.file_dialog.as_mut().unwrap().goto(root.clone());
+        app.file_dialog.as_mut().unwrap().filename.clear();
+        for c in "rt.omaframe.json".chars() {
+            app.dialog_type(c);
+        }
+        app.dialog_confirm();
+        assert!(app.file_dialog.is_none(), "dialog closes on success");
+        let path = root.join("rt.omaframe.json");
+        assert_eq!(app.file_path, Some(path.clone()));
+        assert!(path.exists(), "new_file_to saves immediately");
+
+        // Paint + commit (autosaves through the new binding), then load the
+        // file back in a fresh app via the Open dialog + Enter.
+        app.start_stroke(2, 3, false);
+        app.update_stroke(4, 3, false);
+        app.end_stroke();
+        let on_disk = omaframe::model::load_file(&path).unwrap();
+        assert!(on_disk.cell(2, 3).is_some(), "autosaved stroke on disk");
+
+        let mut app2 = App::new(test_doc(), None);
+        app2.open_load_dialog();
+        app2.file_dialog.as_mut().unwrap().goto(root.clone());
+        {
+            let dlg = app2.file_dialog.as_ref().unwrap();
+            let idx = dlg
+                .entries
+                .iter()
+                .position(|e| !e.is_dir && e.name == "rt.omaframe.json")
+                .unwrap();
+            app2.file_dialog.as_mut().unwrap().selected = Some(idx);
+        }
+        app2.dialog_enter(); // file in Open mode confirms immediately
+        assert!(app2.file_dialog.is_none());
+        assert_eq!(app2.file_path, Some(path.clone()));
+        assert!(app2.doc.cell(2, 3).is_some(), "loaded painted cell");
+
+        // Failure keeps the dialog open: blank SaveAs name confirms nothing.
+        app2.menu_save(); // path bound → plain save, no dialog
+        assert!(app2.file_dialog.is_none());
+        let mut app3 = App::new(test_doc(), None);
+        app3.open_save_new_dialog();
+        app3.file_dialog.as_mut().unwrap().goto(root.clone());
+        app3.file_dialog.as_mut().unwrap().filename.clear();
+        app3.dialog_confirm();
+        assert!(
+            app3.file_dialog.is_some(),
+            "failed/empty confirm stays open"
+        );
+        assert!(app3.status_msg.starts_with("save:"));
+        app3.dialog_cancel();
+        assert!(app3.file_dialog.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn autosave_writes_file_on_stroke_commit() {
+        let root = tempdir("autosave");
+        let path = root.join("a.omaframe.json");
+        let mut app = App::new(test_doc(), Some(path.clone()));
+        assert!(!path.exists());
+        app.start_stroke(1, 1, false);
+        app.update_stroke(2, 1, false);
+        app.end_stroke();
+        assert!(path.exists(), "stroke commit autosaves to the bound path");
+        assert!(!app.dirty);
+        let doc = omaframe::model::load_file(&path).unwrap();
+        assert!(doc.cell(1, 1).is_some());
+        assert!(doc.cell(2, 1).is_some());
+        // Undo/redo also persist.
+        app.undo();
+        let doc = omaframe::model::load_file(&path).unwrap();
+        assert_eq!(doc.cell(1, 1), None);
+        app.redo();
+        let doc = omaframe::model::load_file(&path).unwrap();
+        assert!(doc.cell(2, 1).is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn no_inline_prompt_state_dialogs_instead() {
+        // The inline path-prompt system is gone: file picking is modal.
+        // (Compile-time proof: no `prompt`/`prompt_buf` fields, no
+        // `PromptKind`, no start/confirm_prompt methods remain.)
+        let mut app = App::new(test_doc(), None);
+        assert!(app.file_dialog.is_none(), "no dialog open by default");
+        app.open_load_dialog();
+        assert!(app.file_dialog.is_some());
+        app.dialog_cancel();
+        assert!(app.file_dialog.is_none());
+        // Pathless explicit save opens a SaveAs dialog and returns false.
+        assert!(!app.save());
+        assert!(app.file_dialog.is_some());
+        assert_eq!(
+            app.file_dialog.as_ref().unwrap().purpose,
+            DialogPurpose::SaveAs
+        );
     }
 
     #[test]
     fn menu_file_ops_and_color_pots() {
         let mut app = App::new(test_doc(), None);
-        // New keeps the path slot, resets the canvas.
-        app.file_path = Some(std::path::PathBuf::from("/tmp/n.omaframe.json"));
+        // New-file flow binds the path and saves immediately (macOS-style).
+        let dir = std::env::temp_dir().join("omaframe-newfile-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("n.omaframe.json");
+        let _ = std::fs::remove_file(&path);
         app.dirty = true;
-        app.new_file();
+        assert!(app.new_file_to(path.clone()));
         assert!(!app.dirty);
         assert_eq!(app.history.undo_len(), 0);
-        // Pots clamp to their ranges.
-        app.set_fg(3);
-        assert_eq!(app.fg, 3);
-        app.set_fg(99);
-        assert_eq!(app.fg, 3);
-        app.set_bg(-1);
-        assert_eq!(app.bg, -1);
-        app.set_bg(16);
-        assert_eq!(app.bg, -1);
+        assert!(path.exists(), "created up front");
+        let _ = std::fs::remove_dir_all(&dir);
+        // Truecolor pots accept any PaintColor verbatim.
+        app.set_fg(PaintColor::Ansi(3));
+        assert_eq!(app.fg, PaintColor::Ansi(3));
+        app.set_fg(PaintColor::Rgb(9, 9, 9));
+        assert_eq!(app.fg, PaintColor::Rgb(9, 9, 9));
+        app.set_bg(None);
+        assert_eq!(app.bg, None);
+        assert_eq!(app.bg_label(), "-");
+        app.set_bg(Some(PaintColor::Ansi(5)));
+        assert_eq!(app.bg, Some(PaintColor::Ansi(5)));
         // Pan tool shortcut + full path label.
         assert_eq!(Tool::from_shortcut('_'), Some(Tool::Pan));
         assert!(app.full_path_label().ends_with("n.omaframe.json"));
-        // Colors scroll clamps to the 17 rows.
-        app.scroll_colors(99, 5);
+        // Colors scroll clamps against the caller-provided total.
+        // (17 color rows: transparent + 16 slots, headers add more.)
+        app.scroll_colors(99, 17, 5);
         assert_eq!(app.colors_scroll, 12);
-        app.scroll_colors(-99, 5);
+        app.scroll_colors(-99, 17, 5);
+        assert_eq!(app.colors_scroll, 0);
+        app.scroll_colors(3, 10, 4);
+        assert_eq!(app.colors_scroll, 3);
+        app.scroll_colors(99, 10, 4);
+        assert_eq!(app.colors_scroll, 6);
+        app.scroll_colors(1, 3, 10);
         assert_eq!(app.colors_scroll, 0);
     }
 
@@ -1412,17 +2114,35 @@ mod tests {
     }
 
     #[test]
-    fn grab_copies_cell_into_pencil() {
+    fn grab_copies_cell_into_pencil_verbatim() {
         let mut app = App::new(test_doc(), None);
         let mut patch = Layer::new();
-        patch.set(4, 4, Cell::new("Z", 9, 2));
+        patch.set(
+            4,
+            4,
+            Cell::new("Z", PaintColor::Ansi(9), Some(PaintColor::Ansi(2))),
+        );
+        patch.set(
+            5,
+            5,
+            Cell::new(
+                "Q",
+                PaintColor::Rgb(11, 22, 33),
+                Some(PaintColor::Rgb(44, 55, 66)),
+            ),
+        );
         assert!(app.history.commit(&mut app.doc, &patch));
         assert!(app.grab_at(4, 4));
         assert_eq!(app.ch, "Z");
-        assert_eq!(app.fg, 9);
-        assert_eq!(app.bg, 2);
+        assert_eq!(app.fg, PaintColor::Ansi(9));
+        assert_eq!(app.bg, Some(PaintColor::Ansi(2)));
         assert_eq!(app.tool, Tool::Pencil);
+        // Truecolor cells copy verbatim too.
+        assert!(app.grab_at(5, 5));
+        assert_eq!(app.ch, "Q");
+        assert_eq!(app.fg, PaintColor::Rgb(11, 22, 33));
+        assert_eq!(app.bg, Some(PaintColor::Rgb(44, 55, 66)));
         assert!(!app.grab_at(70, 20)); // empty: changes nothing
-        assert_eq!(app.ch, "Z");
+        assert_eq!(app.ch, "Q");
     }
 }

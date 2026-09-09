@@ -12,9 +12,12 @@ use ratatui::{
     widgets::Paragraph,
 };
 
-use crate::app::{App, COLOR_ROWS, PALETTE_TABS, Tool, palette_chars};
-use omaframe::model;
+use crate::app::{
+    App, DialogPurpose, DirEntry, FileDialog, PALETTE_TABS, Tool, fs_glyphs, palette_chars,
+};
+use omaframe::model::{self, PaintColor};
 use omaframe::theme;
+use omaframe::theme::ColorRow;
 
 // ---------------------------------------------------------------------------
 // Layout
@@ -353,11 +356,18 @@ pub fn hit_menu(areas: &LayoutAreas, col: u16, row: u16) -> Option<MenuAction> {
     }
 }
 
-/// Colors panel rows (see `app::COLOR_ROWS`): row 0 is
-/// transparent-background, rows 1–16 are ANSI slots 0–15 (offset by
-/// `colors_scroll`). Returns the row (0–17).
-pub const COLORS_N: usize = COLOR_ROWS;
+/// Total grouped Colors-panel rows (see `theme::color_rows`). The group
+/// structure (Backgrounds, Foregrounds, Accent, Colors, Brights, Pico-8,
+/// Picotron) is theme-independent, so the default theme gives the canonical
+/// count. `main.rs` passes this to `App::scroll_colors` as `total_rows`.
+pub fn colors_total_rows() -> usize {
+    theme::color_rows(&theme::defaults()).len()
+}
 
+/// Map a click in the Colors panel to a ROW index into `theme::color_rows`
+/// (scroll-adjusted via `app.colors_scroll`, clamped to the row count).
+/// `main.rs` maps the row via `color_rows`: `Header` rows are not clickable
+/// (ignore the click), `Transparent` clears the bg pot, `Entry` sets a pot.
 pub fn hit_colors(
     areas: &LayoutAreas,
     app: &App,
@@ -368,7 +378,7 @@ pub fn hit_colors(
         return None;
     }
     let idx = app.colors_scroll + (row - areas.colors.y) as usize;
-    if idx < COLORS_N {
+    if idx < colors_total_rows() {
         Some(idx)
     } else {
         None
@@ -398,6 +408,138 @@ pub fn over_canvas(areas: &LayoutAreas, col: u16, row: u16) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// File dialog overlay (pure geometry shared by render + main.rs clicks)
+// ---------------------------------------------------------------------------
+
+/// Modal cap sizes: the dialog is `min(72, w-4)` × `min(22, h-2)`.
+pub const DLG_MAX_W: u16 = 72;
+pub const DLG_MAX_H: u16 = 22;
+/// Places-sidebar width (inner columns).
+pub const DLG_SIDEBAR_W: u16 = 16;
+const DLG_CANCEL_W: u16 = 6; // "Cancel"
+const DLG_FOLDER_W: u16 = 7; // "+Folder"
+const DLG_SAVE_W: u16 = 4; // "Open" / "Save"
+
+/// Screen rects for the modal file dialog. `cancel`/`folder`/`save` are the
+/// title-row buttons; `path_row` is the cwd/filename row; `sidebar`/`list`
+/// are the places + entries content rects (header row at `outer.y + 2` is
+/// static and has no hit rect).
+#[derive(Clone, Copy, Debug)]
+pub struct DialogLayout {
+    pub outer: Rect,
+    pub cancel: Rect,
+    pub folder: Rect,
+    pub save: Rect,
+    pub path_row: Rect,
+    pub sidebar: Rect,
+    pub list: Rect,
+}
+
+/// Centered modal `min(72, w-4)` × `min(22, h-2)`; `None` when the area is
+/// below the 60×16 minimum (then nothing renders and no hits apply).
+///
+/// Exact geometry (title row = `outer.y`):
+/// `┌─┐Cancel┌──…┬+Folder┬──┬Open|Save┌─┐` with `Cancel` at `x+3` (6 wide),
+/// `+Folder` centered at `x+(dw-7)/2` (7 wide), `Open`/`Save` at `x+dw-7`
+/// (4 wide, trailing `┌─┐` fills the last 3 cells). `path_row` =
+/// `(x+1, y+1, dw-2, 1)`; `sidebar` =
+/// `(x+1, y+3, 16, dh-4)`; `list` = `(x+18, y+3, dw-19, dh-4)`.
+pub fn dialog_layout(area: Rect) -> Option<DialogLayout> {
+    if area.width < MIN_W || area.height < MIN_H {
+        return None;
+    }
+    let dw = DLG_MAX_W.min(area.width.saturating_sub(4));
+    let dh = DLG_MAX_H.min(area.height.saturating_sub(2));
+    if dw < 10 || dh < 6 {
+        return None;
+    }
+    let x = area.x + (area.width - dw) / 2;
+    let y = area.y + (area.height - dh) / 2;
+    let folder_x = x + (dw - DLG_FOLDER_W) / 2;
+    Some(DialogLayout {
+        outer: Rect::new(x, y, dw, dh),
+        cancel: Rect::new(x + 3, y, DLG_CANCEL_W, 1),
+        folder: Rect::new(folder_x, y, DLG_FOLDER_W, 1),
+        save: Rect::new(x + dw.saturating_sub(3 + DLG_SAVE_W), y, DLG_SAVE_W, 1),
+        path_row: Rect::new(x + 1, y + 1, dw.saturating_sub(2), 1),
+        sidebar: Rect::new(
+            x + 1,
+            y + 3,
+            DLG_SIDEBAR_W.min(dw.saturating_sub(2)),
+            dh.saturating_sub(4),
+        ),
+        list: Rect::new(
+            x + 1 + DLG_SIDEBAR_W + 1,
+            y + 3,
+            dw.saturating_sub(DLG_SIDEBAR_W + 3),
+            dh.saturating_sub(4),
+        ),
+    })
+}
+
+/// Which title-row button a click hit, if any.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DialogButton {
+    Cancel,
+    Folder,
+    Save,
+}
+
+/// Map a click to a title-row button (`Cancel` / `+Folder` / `Open|Save`).
+/// Consult before sidebar/list: the buttons own row `outer.y`.
+pub fn hit_dialog_button(
+    layout: &DialogLayout,
+    col: u16,
+    row: u16,
+) -> Option<DialogButton> {
+    if contains(layout.cancel, col, row) {
+        Some(DialogButton::Cancel)
+    } else if contains(layout.folder, col, row) {
+        Some(DialogButton::Folder)
+    } else if contains(layout.save, col, row) {
+        Some(DialogButton::Save)
+    } else {
+        None
+    }
+}
+
+/// Map a click in the Places sidebar to a `FileDialog::sidebar` index.
+pub fn hit_dialog_sidebar(
+    layout: &DialogLayout,
+    dlg: &FileDialog,
+    col: u16,
+    row: u16,
+) -> Option<usize> {
+    if !contains(layout.sidebar, col, row) {
+        return None;
+    }
+    let idx = (row - layout.sidebar.y) as usize;
+    if idx < dlg.sidebar.len() {
+        Some(idx)
+    } else {
+        None
+    }
+}
+
+/// Map a click in the file list to a `FileDialog::entries` index.
+pub fn hit_dialog_list(
+    layout: &DialogLayout,
+    dlg: &FileDialog,
+    col: u16,
+    row: u16,
+) -> Option<usize> {
+    if !contains(layout.list, col, row) {
+        return None;
+    }
+    let idx = (row - layout.list.y) as usize;
+    if idx < dlg.entries.len() {
+        Some(idx)
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
 
@@ -421,6 +563,19 @@ fn top_titled(w: usize, title: &str) -> String {
 /// Bottom border: `└──…──┘`, exactly `w + 2` cells.
 fn bottom_border(w: usize) -> String {
     format!("└{}┘", "─".repeat(w))
+}
+
+/// Canvas bottom border carrying the content size:
+/// `└─┘Size:{WxH}└──…──┘` (`"empty"` when there is no content), exactly
+/// `w + 2` cells wide like [`bottom_border`].
+fn canvas_bottom(w: usize, size: &str) -> String {
+    let label = truncate_to(&format!("Size:{size}"), w.saturating_sub(4));
+    let mut s = format!("└─┘{label}└");
+    while s.chars().count() < w + 1 {
+        s.push('─');
+    }
+    s.push('┘');
+    s
 }
 
 /// Draw the `│` side borders for the rows strictly between the top and
@@ -539,7 +694,7 @@ fn render_tools(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme)
     let mut lines: Vec<Line> = Vec::new();
     for tool in Tool::ALL {
         let active = tool == app.tool;
-        let marker = if active { ">" } else { " " };
+        let marker = if active { "►" } else { " " };
         let style = if active {
             Style::default().bg(t.accent).fg(t.bg).add_modifier(Modifier::BOLD)
         } else {
@@ -593,7 +748,7 @@ fn render_canvas(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme
         t,
     );
     // Empty cells preview on the same surface as transparent-styled cells.
-    let empty_style = theme::cell_style(7, -1, t, app.preview_dark);
+    let empty_style = theme::cell_style(PaintColor::Ansi(7), None, t, app.preview_dark);
     let cursor_style = Style::default().bg(t.highlight).fg(t.bg).add_modifier(Modifier::BOLD);
     let sel = app.history.selection();
     let mut lines: Vec<Line> = Vec::with_capacity(ch as usize);
@@ -637,7 +792,15 @@ fn render_canvas(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme
     }
     f.render_widget(Paragraph::new(lines), areas.canvas);
     panel_sides(f, outer, t);
-    render_bottom_row(f, outer, w, t);
+    // Bottom border carries the content size (`Size:WxH`, `"empty"`).
+    let size = match model::content_bounds(&app.doc) {
+        Some(b) => format!("{}x{}", b.w, b.h),
+        None => "empty".to_string(),
+    };
+    f.render_widget(
+        Paragraph::new(canvas_bottom(w, &size)).style(Style::default().fg(t.dim)),
+        Rect::new(outer.x, outer.y + outer.height - 1, outer.width, 1),
+    );
 }
 
 fn render_palette(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme) {
@@ -749,9 +912,10 @@ fn render_palette(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Them
     );
 }
 
-/// Colors panel: 17 clickable rows — transparent background, then ANSI
-/// slots 0–15 as wide swatches. Left-click sets fg, right-click sets bg.
-/// Markers: `>` fg pot, `*` bg pot, `#` both.
+/// Colors panel: grouped swatch rows from `theme::color_rows` under a scroll
+/// window (`app.colors_scroll`). Left-click sets fg, right-click sets bg
+/// (`main.rs` maps the clicked row via `color_rows`). Headers render dim and
+/// are not clickable; markers: `>` fg pot, `*` bg pot, `#` both.
 fn render_colors(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme) {
     let outer = outer_of(areas.colors);
     let w = areas.colors.width as usize;
@@ -767,36 +931,53 @@ fn render_colors(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme
         )),
         t,
     );
+    let rows = theme::color_rows(t);
+    let groups = theme::color_groups(t);
     let gh = areas.colors.height as usize;
     let mut lines: Vec<Line> = Vec::new();
     for r in 0..gh {
         let idx = app.colors_scroll + r;
-        if idx >= COLORS_N {
+        let Some(row) = rows.get(idx) else {
             lines.push(Line::from(""));
             continue;
-        }
-        if idx == 0 {
-            let mark = if app.bg < 0 { "*" } else { " " };
-            lines.push(Line::from(vec![
-                Span::styled(mark.to_string(), Style::default().fg(t.fg)),
-                Span::styled(" –none– ", Style::default().fg(t.dim)),
-            ]));
-            continue;
-        }
-        let slot = (idx - 1) as i8;
-        let mark = match (app.fg == slot, app.bg == slot) {
-            (true, true) => "#",
-            (true, false) => ">",
-            (false, true) => "*",
-            (false, false) => " ",
         };
-        lines.push(Line::from(vec![
-            Span::styled(mark.to_string(), Style::default().fg(t.fg)),
-            Span::styled(
-                "█████████",
-                Style::default().fg(t.ansi[slot as usize]).bg(t.bg),
-            ),
-        ]));
+        match row {
+            ColorRow::Header(name) => {
+                lines.push(Line::from(vec![Span::styled(
+                    truncate_to(&format!("-{name}-"), w),
+                    Style::default().fg(t.dim),
+                )]));
+            }
+            ColorRow::Transparent => {
+                let mark = if app.bg.is_none() { "*" } else { " " };
+                lines.push(Line::from(vec![
+                    Span::styled(mark.to_string(), Style::default().fg(t.fg)),
+                    Span::styled(" -none- ", Style::default().fg(t.dim)),
+                ]));
+            }
+            ColorRow::Entry { group, index } => {
+                let color = groups
+                    .get(*group)
+                    .and_then(|g| g.entries.get(*index))
+                    .map(|e| e.color)
+                    .unwrap_or(PaintColor::Ansi(7));
+                let mark = match (app.fg == color, app.bg == Some(color)) {
+                    (true, true) => "#",
+                    (true, false) => ">",
+                    (false, true) => "*",
+                    (false, false) => " ",
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(mark.to_string(), Style::default().fg(t.fg)),
+                    Span::styled(
+                        "█████████",
+                        Style::default()
+                            .fg(theme::resolve(color, t))
+                            .bg(t.bg),
+                    ),
+                ]));
+            }
+        }
     }
     f.render_widget(Paragraph::new(lines), areas.colors);
     panel_sides(f, outer, t);
@@ -847,25 +1028,12 @@ fn render_layers_panel(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme:
 }
 
 fn render_status(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme) {
-    // Inline path prompt (menu Load / Save As) takes over the status bar.
-    if let Some(kind) = app.prompt {
-        let msg = format!(
-            "{}: {}█   (Enter ok · Esc cancel)",
-            kind.caption(),
-            app.prompt_buf
-        );
-        f.render_widget(
-            Paragraph::new(truncate_to(&msg, areas.status.width as usize))
-                .style(Style::default().bg(t.highlight).fg(t.fg)),
-            areas.status,
-        );
-        return;
-    }
+    // Plain status line (the inline path prompt is gone; file I/O goes
+    // through the modal dialog rendered on top).
     let size = match model::content_bounds(&app.doc) {
         Some(b) => format!("{}x{}", b.w, b.h),
         None => "empty".to_string(),
     };
-    let bg_label = if app.bg < 0 { "-".to_string() } else { app.bg.to_string() };
     let sel = match app.history.selection() {
         Some(r) => format!(" sel {}x{}@{},{}", r.w, r.h, r.x, r.y),
         None => String::new(),
@@ -875,8 +1043,8 @@ fn render_status(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme
         app.cursor.0,
         app.cursor.1,
         app.active_layer_name(),
-        app.fg,
-        bg_label,
+        app.fg_label(),
+        app.bg_label(),
         app.file_label(),
         size,
         sel,
@@ -911,18 +1079,260 @@ pub fn render(f: &mut Frame, app: &mut App, t: &theme::Theme) {
     render_palette(f, &areas, app, t);
     render_layers_panel(f, &areas, app, t);
     render_status(f, &areas, app, t);
+    // Modal file dialog on top (nothing when closed or too small).
+    if app.file_dialog.is_some() {
+        render_dialog(f, area, app, t);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// File dialog render (modal overlay; rects mirror `dialog_layout` exactly)
+// ---------------------------------------------------------------------------
+
+/// Pad/truncate `s` to exactly `w` display columns (char-based; dialog
+/// content is narrow glyphs, same discipline as the rest of the chrome).
+fn fit_to(s: &str, w: usize) -> String {
+    let mut out = truncate_to(s, w);
+    while out.chars().count() < w {
+        out.push(' ');
+    }
+    out
+}
+
+/// Human size for the dialog list (`"—"` for dirs, `B`/`KB`/`MB`).
+fn human_size(size: u64, is_dir: bool) -> String {
+    if is_dir {
+        return "—".to_string();
+    }
+    if size < 1024 {
+        format!("{size} B")
+    } else if size < 1024 * 1024 {
+        format!("{:.1} KB", size as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", size as f64 / 1_048_576.0)
+    }
+}
+
+/// Type column for the dialog list: `"dir"`, the file extension, or `"file"`.
+fn entry_type(e: &DirEntry) -> String {
+    if e.is_dir {
+        return "dir".to_string();
+    }
+    match e.name.rsplit('.').next() {
+        Some(ext) if !ext.is_empty() && ext.len() < e.name.len() => {
+            truncate_to(ext, 8).to_string()
+        }
+        _ => "file".to_string(),
+    }
+}
+
+/// Title row `┌─┐Cancel┌──…┬+Folder┬──┬Open|Save┌─┐`, exactly `dw` cells.
+/// Button spans sit at EXACTLY the [`dialog_layout`] rects: `Cancel` at
+/// `+3`, `+Folder` at `+(dw-7)/2`, save label at `+dw-7` (`dialog_title_text`
+/// builds the same string; this splits it into styled spans).
+fn dialog_title_line_styled(
+    dw: usize,
+    save_label: &str,
+    dim: Style,
+    btn: Style,
+    save_style: Style,
+) -> Line<'static> {
+    let raw = dialog_title_text(dw, save_label);
+    let folder_off = (dw.saturating_sub(DLG_FOLDER_W as usize)) / 2;
+    let save_off = dw.saturating_sub(3 + DLG_SAVE_W as usize);
+    let chars: Vec<char> = raw.chars().collect();
+    let slice = |a: usize, b: usize| -> String {
+        chars.get(a..b).unwrap_or(&[]).iter().collect()
+    };
+    Line::from(vec![
+        Span::styled(slice(0, 3), dim),
+        Span::styled(slice(3, 3 + DLG_CANCEL_W as usize), btn),
+        Span::styled(slice(3 + DLG_CANCEL_W as usize, folder_off), dim),
+        Span::styled(
+            slice(folder_off, folder_off + DLG_FOLDER_W as usize),
+            btn,
+        ),
+        Span::styled(
+            slice(folder_off + DLG_FOLDER_W as usize, save_off),
+            dim,
+        ),
+        Span::styled(
+            slice(save_off, save_off + DLG_SAVE_W as usize),
+            save_style,
+        ),
+        Span::styled(slice(save_off + DLG_SAVE_W as usize, dw), dim),
+    ])
+}
+
+/// Plain-text title row (same offsets as [`dialog_layout`]); the styled
+/// renderer above splits this text at the button boundaries.
+fn dialog_title_text(dw: usize, save_label: &str) -> String {
+    let folder_off = (dw.saturating_sub(DLG_FOLDER_W as usize)) / 2;
+    let save_off = dw.saturating_sub(3 + DLG_SAVE_W as usize);
+    let mut s = String::from("┌─┐Cancel┌");
+    while s.chars().count() + 1 < folder_off {
+        s.push('─');
+    }
+    s.push('┬');
+    s.push_str("+Folder┬");
+    while s.chars().count() + 1 < save_off {
+        s.push('─');
+    }
+    s.push('┬');
+    s.push_str(save_label);
+    s.push_str("┌─┐");
+    fit_to(&s, dw)
+}
+
+fn render_dialog(f: &mut Frame, area: Rect, app: &App, t: &theme::Theme) {
+    let Some(dlg) = app.file_dialog.as_ref() else {
+        return;
+    };
+    let Some(l) = dialog_layout(area) else {
+        return;
+    };
+    let dw = l.outer.width as usize;
+    let dh = l.outer.height as usize;
+    if dw < 10 || dh < 6 {
+        return;
+    }
+    let dim = Style::default().fg(t.dim);
+    let btn = Style::default().fg(t.fg);
+    let save_style = Style::default()
+        .fg(t.accent)
+        .add_modifier(Modifier::BOLD);
+    let hl = Style::default()
+        .bg(t.accent)
+        .fg(t.bg)
+        .add_modifier(Modifier::BOLD);
+
+    let save_label = if matches!(dlg.purpose, DialogPurpose::Load) {
+        "Open"
+    } else {
+        "Save"
+    };
+
+    // Title row with the three buttons at the `dialog_layout` rects.
+    let title = dialog_title_line_styled(dw, save_label, dim, btn, save_style);
+    f.render_widget(
+        Paragraph::new(title),
+        Rect::new(l.outer.x, l.outer.y, l.outer.width, 1),
+    );
+
+    // Path row: `│ {cwd}/{filename or selected} │` (cursor block in saves).
+    let cwd = dlg.cwd.display().to_string();
+    let path_content = if matches!(dlg.purpose, DialogPurpose::Load) {
+        match dlg.selected.and_then(|s| dlg.entries.get(s)) {
+            Some(e) if e.is_dir => format!("{cwd}/{}/", e.name),
+            Some(e) => format!("{cwd}/{}", e.name),
+            None => cwd,
+        }
+    } else {
+        format!("{cwd}/{}█", dlg.filename)
+    };
+    let path_line = Line::from(vec![
+        Span::styled("│ ", dim),
+        Span::styled(
+            fit_to(&path_content, dw.saturating_sub(4)),
+            Style::default().fg(t.fg),
+        ),
+        Span::styled(" │", dim),
+    ]);
+    f.render_widget(Paragraph::new(path_line), l.path_row);
+
+    // Column header (static sort indicator): `│ Places │ Name ▼ │ … │`.
+    let list_w = l.list.width as usize;
+    let header_right = fit_to(" Name ▼  Size    Type  Modified", list_w);
+    let header_line = Line::from(vec![
+        Span::styled("│ ", dim),
+        Span::styled(fit_to("Places", DLG_SIDEBAR_W as usize), dim),
+        Span::styled("│", dim),
+        Span::styled(header_right, dim),
+        Span::styled("│", dim),
+    ]);
+    f.render_widget(
+        Paragraph::new(header_line),
+        Rect::new(l.outer.x, l.outer.y + 2, l.outer.width, 1),
+    );
+
+    // Sidebar + list rows.
+    let (folder_glyph, file_glyph) = fs_glyphs();
+    let side_w = l.sidebar.width as usize;
+    for r in 0..l.sidebar.height {
+        let y = l.sidebar.y + r;
+        let i = r as usize;
+        let (text, style) = match dlg.sidebar.get(i) {
+            // Sidebar tuple is `(label, icon, path)`; highlight the row
+            // whose path is the dialog cwd.
+            Some((label, icon, path)) => {
+                let s = fit_to(&format!("{icon} {label}"), side_w);
+                if *path == dlg.cwd {
+                    (s, hl)
+                } else {
+                    (s, Style::default().fg(t.fg))
+                }
+            }
+            None => (fit_to("", side_w), Style::default().fg(t.fg)),
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("│", dim),
+                Span::styled(text, style),
+            ])),
+            Rect::new(l.outer.x, y, side_w as u16 + 1, 1),
+        );
+        let (ltext, lstyle) = match dlg.entries.get(i) {
+            Some(e) => {
+                let glyph = if e.is_dir {
+                    folder_glyph.clone()
+                } else {
+                    file_glyph.clone()
+                };
+                let s = fit_to(
+                    &format!(
+                        " {glyph} {} {} {} {}",
+                        e.name,
+                        human_size(e.size, e.is_dir),
+                        entry_type(e),
+                        e.modified
+                    ),
+                    list_w,
+                );
+                if dlg.selected == Some(i) {
+                    (s, hl)
+                } else {
+                    (s, Style::default().fg(t.fg))
+                }
+            }
+            None => (fit_to("", list_w), Style::default().fg(t.fg)),
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("│", dim),
+                Span::styled(ltext, lstyle),
+                Span::styled("│", dim),
+            ])),
+            Rect::new(l.list.x - 1, y, l.list.width + 2, 1),
+        );
+    }
+
+    // Sides + bottom border.
+    panel_sides(f, l.outer, t);
+    render_bottom_row(f, l.outer, dw.saturating_sub(2), t);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::{DialogMode, DialogPurpose, DirEntry};
     use omaframe::model::{Cell, Document};
     use ratatui::{Terminal, backend::TestBackend};
+    use std::path::PathBuf;
 
     fn harness() -> (App, theme::Theme) {
         let mut doc = Document::new("t", 80, 24);
         doc.active_layer_mut()
-            .set(2, 1, Cell::new("x", 7, -1));
+            .set(2, 1, Cell::new("x", PaintColor::Ansi(7), None));
         (App::new(doc, None), theme::defaults())
     }
 
@@ -966,7 +1376,7 @@ mod tests {
         assert_eq!(a.palette_grid.y, a.palette_tabs.y + 7 + 1);
         // Colors rows map: 0 transparent, then ANSI slots; clicks outside
         // the visible rows miss.
-        let mut probe = App::new(
+        let probe = App::new(
             omaframe::model::Document::new("t", 80, 24),
             None,
         );
@@ -981,37 +1391,6 @@ mod tests {
             None
         );
         assert!(over_colors(&a, a.colors.x, a.colors.y));
-    }
-
-    #[test]
-    fn wireframe_chrome_snapshot() {
-        // The user-supplied wireframe: menu bar, boxed Tools/Colors/Palette,
-        // origin-titled canvas. Renders the demo doc headless at 80x24.
-        let doc =
-            omaframe::model::load_json(include_str!("../testdata/demo.omaframe.json"))
-                .expect("demo");
-        let (mut app, t) = (App::new(doc, None), theme::defaults());
-        let buf = render_to_buf(&mut app, &t);
-        let rows: Vec<String> = (0..24)
-            .map(|y| {
-                (0..80)
-                    .map(|x| buf[(x, y)].symbol().to_string())
-                    .collect::<String>()
-            })
-            .collect();
-        let screen = rows.join("\n");
-        for needle in [
-            "New", "Save", "Load", // menu bar
-            "Tools", "pan",        // tools box + Pan tool
-            "Colors", "none",      // colors box + transparent row
-            "Palette", "Outline", "Glyphs", // palette box + renamed tabs
-            "Layers",              // layers panel
-            "0,0",                 // canvas origin in its border
-            "untitled",            // file row
-            "┌", "┐", "└", "┘", "│", "─", // box chrome
-        ] {
-            assert!(screen.contains(needle), "missing {needle:?}:\n{screen}");
-        }
     }
 
     #[test]
@@ -1049,26 +1428,27 @@ mod tests {
 
     #[test]
     fn layers_panel_maps_topmost_first() {
-        let (app, _) = harness();
-        // Harness doc has the 3 default layers; rows show topmost first.
-        let a = compute_layout(ratatui::layout::Rect::new(0, 0, 80, 24), 3);
-        assert_eq!(a.layer_rows.height, 3);
+        let (harness_app, _) = harness();
+        // Harness doc has the default layers; rows show topmost first.
+        let n = harness_app.doc.layers.len();
+        let a = compute_layout(ratatui::layout::Rect::new(0, 0, 80, 24), n);
+        assert_eq!(a.layer_rows.height, n as u16);
         let y0 = a.layer_rows.y;
-        // Row 0 → Text (top, idx 2); row 2 → Background (idx 0).
+        // Row 0 → top layer (idx n-1); last row → Background (idx 0).
         assert_eq!(
-            hit_layer_row(&a, 3, a.layer_rows.x + 5, y0),
-            Some((2, false))
+            hit_layer_row(&a, n, a.layer_rows.x + 5, y0),
+            Some((n - 1, false))
         );
         assert_eq!(
-            hit_layer_row(&a, 3, a.layer_rows.x + 5, y0 + 2),
+            hit_layer_row(&a, n, a.layer_rows.x + 5, y0 + n as u16 - 1),
             Some((0, false))
         );
         // First two columns toggle the eye.
         assert_eq!(
-            hit_layer_row(&a, 3, a.layer_rows.x, y0 + 1),
-            Some((1, true))
+            hit_layer_row(&a, n, a.layer_rows.x, y0 + 1),
+            Some((n - 2, true))
         );
-        assert_eq!(hit_layer_row(&a, 3, a.layer_rows.x, y0 + 3), None);
+        assert_eq!(hit_layer_row(&a, n, a.layer_rows.x, y0 + n as u16), None);
     }
 
     #[test]
@@ -1106,5 +1486,245 @@ mod tests {
         assert!(buf[(sx, sy)].modifier.contains(Modifier::REVERSED));
         let (ox, oy) = screen_of(0, 0);
         assert!(!buf[(ox, oy)].modifier.contains(Modifier::REVERSED));
+    }
+
+    fn screen_text(buf: &ratatui::buffer::Buffer) -> String {
+        let (w, h) = (buf.area.width, buf.area.height);
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn grouped_colors_rows_render() {
+        let t = theme::defaults();
+        let rows = theme::color_rows(&t);
+        assert!(
+            rows.len() > 17,
+            "grouped rows exceed the old 17: {}",
+            rows.len()
+        );
+        assert_eq!(rows.len(), colors_total_rows());
+        // A Pico-8 group header exists per the theme contract.
+        let pico = rows
+            .iter()
+            .position(|r| {
+                matches!(r, ColorRow::Header(n) if n.to_ascii_lowercase().contains("pico"))
+            })
+            .expect("pico-8 header present");
+        let pico_name = match &rows[pico] {
+            ColorRow::Header(n) => n.clone(),
+            _ => unreachable!(),
+        };
+        // Scroll the header to the top of the window and check the dim
+        // `-Name-` row renders.
+        let (mut app, t) = (App::new(Document::new("t", 80, 24), None), t);
+        app.colors_scroll = pico;
+        let screen = screen_text(&render_to_buf(&mut app, &t));
+        assert!(
+            screen.contains(&format!("-{pico_name}-")),
+            "missing header -{pico_name}-:\n{screen}"
+        );
+        // Transparent row renders ` -none- ` with the `*` bg marker.
+        let transp = rows
+            .iter()
+            .position(|r| matches!(r, ColorRow::Transparent))
+            .expect("transparent row present");
+        app.bg = None;
+        app.colors_scroll = transp;
+        let screen = screen_text(&render_to_buf(&mut app, &t));
+        assert!(screen.contains("-none-"), "missing -none-:\n{screen}");
+        // Entry row: fg pot marker `>` plus a 9-block swatch.
+        let (entry_idx, entry_color) = rows
+            .iter()
+            .enumerate()
+            .find_map(|(i, r)| match r {
+                ColorRow::Entry { group, index } => theme::color_groups(&t)
+                    .get(*group)
+                    .and_then(|g| g.entries.get(*index))
+                    .map(|e| (i, e.color)),
+                _ => None,
+            })
+            .expect("at least one entry row");
+        app.fg = entry_color;
+        app.bg = None;
+        app.colors_scroll = entry_idx;
+        let areas = compute_layout(ratatui::layout::Rect::new(0, 0, 80, 24), 3);
+        assert_eq!(
+            hit_colors(&areas, &app, areas.colors.x, areas.colors.y),
+            Some(entry_idx)
+        );
+        let buf = render_to_buf(&mut app, &t);
+        assert_eq!(buf[(areas.colors.x, areas.colors.y)].symbol(), ">");
+        let row_text: String = (0..areas.colors.width)
+            .map(|x| buf[(areas.colors.x + x, areas.colors.y)].symbol().to_string())
+            .collect();
+        assert!(
+            row_text.contains("█████████"),
+            "missing swatch in {row_text:?}"
+        );
+        // Both pots on the entry → `#`; bg pot only → `*`.
+        app.bg = Some(entry_color);
+        let buf = render_to_buf(&mut app, &t);
+        assert_eq!(buf[(areas.colors.x, areas.colors.y)].symbol(), "#");
+        app.fg = PaintColor::Ansi(0);
+        if entry_color != PaintColor::Ansi(0) {
+            let buf = render_to_buf(&mut app, &t);
+            assert_eq!(buf[(areas.colors.x, areas.colors.y)].symbol(), "*");
+        }
+    }
+
+    #[test]
+    fn tools_rail_uses_pointer_marker() {
+        let (mut app, t) = harness();
+        let screen = screen_text(&render_to_buf(&mut app, &t));
+        // Active tool (pencil) carries `►`; tabs keep `>`.
+        assert!(screen.contains("►p pencil"), "missing ► marker:\n{screen}");
+        assert!(screen.contains("> Outline"), "tabs keep >:\n{screen}");
+        app.set_tool(Tool::Pan);
+        let screen = screen_text(&render_to_buf(&mut app, &t));
+        assert!(screen.contains("►_ pan"), "moved ► marker:\n{screen}");
+    }
+
+    #[test]
+    fn canvas_bottom_border_shows_content_size() {
+        let (mut app, t) = harness();
+        // Harness paints one cell at (2,1) → 1×1 content.
+        let screen = screen_text(&render_to_buf(&mut app, &t));
+        assert!(screen.contains("Size:1x1"), "missing Size:1x1:\n{screen}");
+        let (mut app, t) = (App::new(Document::new("t", 80, 24), None), t);
+        let screen = screen_text(&render_to_buf(&mut app, &t));
+        assert!(
+            screen.contains("Size:empty"),
+            "missing Size:empty:\n{screen}"
+        );
+    }
+
+    fn fake_dialog(purpose: DialogPurpose) -> FileDialog {
+        FileDialog {
+            mode: if matches!(purpose, DialogPurpose::Load) {
+                DialogMode::Open
+            } else {
+                DialogMode::Save
+            },
+            purpose,
+            cwd: PathBuf::from("/tmp/oma"),
+            entries: vec![
+                DirEntry {
+                    name: "docs".to_string(),
+                    is_dir: true,
+                    size: 0,
+                    modified: "2d ago".to_string(),
+                },
+                DirEntry {
+                    name: "a.omaframe.json".to_string(),
+                    is_dir: false,
+                    size: 2048,
+                    modified: "5m ago".to_string(),
+                },
+            ],
+            selected: Some(1),
+            filename: "new.omaframe.json".to_string(),
+            sidebar: vec![
+                ("Home".to_string(), "D".to_string(), PathBuf::from("/home/u")),
+                ("Root".to_string(), "D".to_string(), PathBuf::from("/")),
+            ],
+        }
+    }
+
+    #[test]
+    fn dialog_layout_geometry_and_hits() {
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let l = dialog_layout(area).expect("80x24 fits a dialog");
+        // Centered 72×22: origin (4, 1).
+        assert_eq!(
+            (l.outer.x, l.outer.y, l.outer.width, l.outer.height),
+            (4, 1, 72, 22)
+        );
+        assert_eq!((l.cancel.x, l.cancel.y, l.cancel.width), (7, 1, 6));
+        assert_eq!((l.folder.x, l.folder.y, l.folder.width), (36, 1, 7));
+        assert_eq!((l.save.x, l.save.y, l.save.width), (69, 1, 4));
+        assert_eq!(
+            (l.path_row.x, l.path_row.y, l.path_row.width, l.path_row.height),
+            (5, 2, 70, 1)
+        );
+        assert_eq!(
+            (
+                l.sidebar.x,
+                l.sidebar.y,
+                l.sidebar.width,
+                l.sidebar.height
+            ),
+            (5, 4, 16, 18)
+        );
+        assert_eq!(
+            (l.list.x, l.list.y, l.list.width, l.list.height),
+            (22, 4, 53, 18)
+        );
+        // Buttons.
+        assert_eq!(hit_dialog_button(&l, 7, 1), Some(DialogButton::Cancel));
+        assert_eq!(hit_dialog_button(&l, 12, 1), Some(DialogButton::Cancel));
+        assert_eq!(hit_dialog_button(&l, 36, 1), Some(DialogButton::Folder));
+        assert_eq!(hit_dialog_button(&l, 69, 1), Some(DialogButton::Save));
+        assert_eq!(hit_dialog_button(&l, 72, 1), Some(DialogButton::Save));
+        assert_eq!(hit_dialog_button(&l, 20, 1), None);
+        assert_eq!(hit_dialog_button(&l, 7, 2), None);
+        // Sidebar + list (fake FileDialog struct literal — fields are pub).
+        let dlg = fake_dialog(DialogPurpose::SaveAs);
+        assert_eq!(hit_dialog_sidebar(&l, &dlg, 5, 4), Some(0));
+        assert_eq!(hit_dialog_sidebar(&l, &dlg, 5, 5), Some(1));
+        assert_eq!(hit_dialog_sidebar(&l, &dlg, 5, 6), None);
+        assert_eq!(hit_dialog_sidebar(&l, &dlg, 22, 4), None);
+        assert_eq!(hit_dialog_list(&l, &dlg, 22, 4), Some(0));
+        assert_eq!(hit_dialog_list(&l, &dlg, 22, 5), Some(1));
+        assert_eq!(hit_dialog_list(&l, &dlg, 22, 6), None);
+        assert_eq!(hit_dialog_list(&l, &dlg, 5, 4), None);
+        // Too small → None.
+        assert!(dialog_layout(ratatui::layout::Rect::new(0, 0, 59, 24)).is_none());
+        assert!(dialog_layout(ratatui::layout::Rect::new(0, 0, 80, 15)).is_none());
+        // Title text places the buttons at exactly the hit rects.
+        let text = dialog_title_text(72, "Save");
+        assert_eq!(text.chars().count(), 72);
+        let chars: Vec<char> = text.chars().collect();
+        let s: String = chars[3..9].iter().collect();
+        assert_eq!(s, "Cancel");
+        let s: String = chars[36 - 4..36 - 4 + 7].iter().collect();
+        assert_eq!(s, "+Folder");
+        let s: String = chars[69 - 4..69 - 4 + 4].iter().collect();
+        assert_eq!(s, "Save");
+    }
+
+    #[test]
+    fn dialog_snapshot_contains_chrome() {
+        let (mut app, t) = harness();
+        app.file_dialog = Some(fake_dialog(DialogPurpose::SaveAs));
+        let screen = screen_text(&render_to_buf(&mut app, &t));
+        for needle in [
+            "Cancel",
+            "Save",
+            "+Folder",
+            "Places",
+            "Name",
+            "new.omaframe.json",
+            "a.omaframe.json",
+            "docs",
+            "Home",
+        ] {
+            assert!(screen.contains(needle), "missing {needle:?}:\n{screen}");
+        }
+        // Load purpose labels the confirm button Open and shows the selected
+        // name in the path row instead of the filename box.
+        app.file_dialog = Some(fake_dialog(DialogPurpose::Load));
+        let screen = screen_text(&render_to_buf(&mut app, &t));
+        assert!(screen.contains("Open"), "missing Open:\n{screen}");
+        assert!(
+            screen.contains("a.omaframe.json"),
+            "missing selected name:\n{screen}"
+        );
     }
 }

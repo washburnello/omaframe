@@ -64,42 +64,21 @@ fn parse_selection(s: &str) -> Result<Rect, String> {
     Ok(Rect::new(x, y, w as u32, h as u32))
 }
 
-fn fg_sgr(fg: i8) -> i32 {
-    if fg < 8 {
-        30 + fg as i32
-    } else {
-        90 + (fg as i32 - 8)
-    }
-}
-
-fn bg_sgr(bg: i8) -> Option<i32> {
-    if bg < 0 {
-        None
-    } else if bg < 8 {
-        Some(40 + bg as i32)
-    } else {
-        Some(100 + (bg as i32 - 8))
-    }
-}
-
 /// ANSI export clipped to `rect` (mirrors `model::export_ansi` row rules:
 /// continuation guards emit nothing, trailing transparent cells trimmed,
-/// fully-empty trailing rows skipped, SGR `30–37`/`90–97` +
-/// `40–47`/`100–107`, reset after the last colored cell).
+/// fully-empty trailing rows skipped, SGR fg + bg with reset after the last
+/// colored cell). Unbounded like the infinite canvas (no grid clip).
 fn export_ansi_selection(doc: &model::Document, rect: &Rect) -> String {
-    let gw = doc.grid.0.min(i32::MAX as u32) as i64;
-    let gh = doc.grid.1.min(i32::MAX as u32) as i64;
-    let x1 = (rect.x as i64 + rect.w as i64).min(gw);
-    let y1 = (rect.y as i64 + rect.h as i64).min(gh);
-    let x0c = rect.x.max(0);
-    let y0c = rect.y.max(0);
-    if x0c as i64 >= x1 || y0c as i64 >= y1 || rect.is_empty() {
+    use omaframe::model::PaintColor;
+    type ColorSeg = (String, Option<(PaintColor, Option<PaintColor>)>);
+    if rect.is_empty() {
         return String::new();
-    }
+    }    let x_end = (rect.x as i64 + rect.w as i64).min(i32::MAX as i64);
+    let y_end = (rect.y as i64 + rect.h as i64).min(i32::MAX as i64);
     let mut lines = Vec::new();
-    for y in y0c..y1 as i32 {
-        let mut segs: Vec<(String, Option<(i8, i8)>)> = Vec::new();
-        for x in x0c..x1 as i32 {
+    for y in rect.y..y_end as i32 {
+        let mut segs: Vec<ColorSeg> = Vec::new();
+        for x in rect.x..x_end as i32 {
             if doc.is_continuation(x, y) {
                 continue;
             }
@@ -119,19 +98,19 @@ fn export_ansi_selection(doc: &model::Document, rect: &Rect) -> String {
             continue;
         }
         let mut line = String::new();
-        let mut cur: Option<(i8, i8)> = None;
+        let mut cur: Option<(PaintColor, Option<PaintColor>)> = None;
         for (s, col) in &segs {
             if *col != cur {
                 if col.is_none() {
                     line.push_str("\x1b[0m");
                 } else {
-                    let (fg, bg) = col.unwrap();
-                    match bg_sgr(bg) {
+                    let (fg, bg) = col.expect("matched Some");
+                    match PaintColor::sgr_bg(bg) {
                         Some(bg_code) => {
-                            line.push_str(&format!("\x1b[{};{}m", fg_sgr(fg), bg_code));
+                            line.push_str(&format!("\x1b[{};{}m", fg.sgr_fg(), bg_code));
                         }
                         None => {
-                            line.push_str(&format!("\x1b[{}m", fg_sgr(fg)));
+                            line.push_str(&format!("\x1b[{}m", fg.sgr_fg()));
                         }
                     }
                 }

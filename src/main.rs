@@ -1,7 +1,10 @@
 //! omaframe — native terminal TUI wireframing app.
 //!
 //! `omaframe [FILE]`: opens the file or creates an 80×24 doc bound to that
-//! path. Ctrl-S saves, exit autosaves to the same path (prompt-free).
+//! path. Ctrl-S saves (SaveAs dialog when pathless), exit autosaves to the
+//! same path. File picking is modal: menu New/Load open a file dialog
+//! (`app.file_dialog`), and while it is open all keys/mouse go to the
+//! dialog delegates.
 
 mod app;
 mod ui;
@@ -17,11 +20,11 @@ use crossterm::{
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use omaframe::model::{Document, load_file};
+use omaframe::model::{Document, PaintColor, load_file};
 use omaframe::{clipboard, theme};
 use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 
-use app::{App, Tool, palette_chars};
+use app::{App, DialogMode, Tool, palette_chars};
 use ui::LayoutAreas;
 
 fn doc_name_for(path: &std::path::Path) -> String {
@@ -32,6 +35,8 @@ fn doc_name_for(path: &std::path::Path) -> String {
 }
 
 fn open_or_create(path: Option<PathBuf>) -> (Document, Option<PathBuf>) {
+    // Tilde-expand CLI paths (`omaframe ~/x.omaframe.json` just works).
+    let path = path.map(|p| App::expand_path(&p.to_string_lossy()));
     match path {
         Some(p) => {
             if p.exists() {
@@ -75,16 +80,89 @@ fn handle_canvas_press(app: &mut App, doc_pos: (i32, i32), shift: bool) {
     app.start_stroke(doc_pos.0, doc_pos.1, shift);
 }
 
+/// True when the open dialog is an Open picker (vs a save picker).
+fn dialog_is_open_mode(app: &App) -> bool {
+    app.file_dialog
+        .as_ref()
+        .is_some_and(|d| d.mode == DialogMode::Open)
+}
+
+/// True when the dialog highlight sits on a file (not a directory).
+fn dialog_selected_is_file(app: &App) -> bool {
+    app.file_dialog.as_ref().is_some_and(|d| {
+        d.selected
+            .and_then(|i| d.entries.get(i))
+            .is_some_and(|e| !e.is_dir)
+    })
+}
+
+/// Swatch color for a [`theme::ColorRow::Entry`] address (None when the
+/// address is stale — rows and groups are built from the same theme, so
+/// this only fires across a theme reload mid-click).
+fn color_at(theme: &theme::Theme, group: usize, index: usize) -> Option<PaintColor> {
+    theme::color_groups(theme)
+        .get(group)?
+        .entries
+        .get(index)
+        .map(|e| e.color)
+}
+
 fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
     let ctrl = mods.contains(KeyModifiers::CONTROL);
     let alt = mods.contains(KeyModifiers::ALT);
     let shift = mods.contains(KeyModifiers::SHIFT);
 
+    // --- Modal file dialog: captures all keys ---
+    if app.file_dialog.is_some() {
+        if alt && code == KeyCode::Up {
+            app.dialog_up();
+            return true;
+        }
+        if ctrl {
+            match code {
+                KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Char('c') | KeyCode::Char('C') => {
+                    app.autosave();
+                    app.should_quit = true;
+                }
+                // Leave Ctrl-S on its normal save path (never confirms).
+                KeyCode::Char('s') | KeyCode::Char('S') => {
+                    app.menu_save();
+                }
+                // Swallow every other Ctrl combo (no undo/redo/etc. inside
+                // the dialog).
+                _ => {}
+            }
+            return true;
+        }
+        match code {
+            KeyCode::Esc => app.dialog_cancel(),
+            KeyCode::Enter => {
+                // Open picker with a file highlighted confirms at once;
+                // anything else descends / commits the filename box.
+                if dialog_is_open_mode(app) && dialog_selected_is_file(app) {
+                    app.dialog_confirm();
+                } else {
+                    app.dialog_enter();
+                }
+            }
+            KeyCode::Up => app.dialog_move_selection(-1),
+            KeyCode::Down => app.dialog_move_selection(1),
+            KeyCode::Backspace => app.dialog_backspace(),
+            KeyCode::Char(c) if !alt => {
+                // Save pickers type the filename here; Open mode ignores
+                // typing (`dialog_type` itself decides).
+                app.dialog_type(c);
+            }
+            _ => {}
+        }
+        return true;
+    }
+
     // --- Ctrl combos (never typed as text) ---
     if ctrl {
         match code {
             KeyCode::Char('s') | KeyCode::Char('S') => {
-                app.save();
+                app.menu_save();
                 return true;
             }
             KeyCode::Char('z') | KeyCode::Char('Z') => {
@@ -131,22 +209,6 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
             }
             _ => return false,
         }
-    }
-
-    // --- Inline path prompt (menu Load / Save As): captures all typing ---
-    if app.prompt.is_some() {
-        match code {
-            KeyCode::Esc => app.cancel_prompt(),
-            KeyCode::Enter => app.confirm_prompt(),
-            KeyCode::Backspace => app.prompt_backspace(),
-            KeyCode::Char(c) => {
-                if !ctrl && !alt {
-                    app.prompt_push(c);
-                }
-            }
-            _ => {}
-        }
-        return true;
     }
 
     // --- Alt combos: tool switching + pots (never typed) ---
@@ -323,31 +385,97 @@ fn export_clipboard(app: &mut App) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_mouse(
     app: &mut App,
     areas: &LayoutAreas,
+    term: Rect,
+    theme: &theme::Theme,
     kind: MouseEventKind,
     col: u16,
     row: u16,
     mods: KeyModifiers,
 ) {
     let shift = mods.contains(KeyModifiers::SHIFT);
+
+    // --- Modal file dialog: ONLY dialog hits, everything else ignored ---
+    if app.file_dialog.is_some() {
+        if kind == MouseEventKind::Down(MouseButton::Left) {
+            // `dialog_layout` is None on tiny terminals: no dialog targets
+            // exist, so the click is ignored like any other non-dialog one.
+            if let Some(dlg_layout) = ui::dialog_layout(term) {
+                if let Some(btn) = ui::hit_dialog_button(&dlg_layout, col, row) {
+                    match btn {
+                        ui::DialogButton::Cancel => app.dialog_cancel(),
+                        ui::DialogButton::Folder => app.dialog_make_folder(),
+                        ui::DialogButton::Save => app.dialog_confirm(),
+                    }
+                    return;
+                }
+                // Sidebar/list hits borrow the dialog immutably; the
+                // borrows end here so the delegates below may mutate.
+                let (side_hit, list_hit) = match app.file_dialog.as_ref() {
+                    Some(d) => (
+                        ui::hit_dialog_sidebar(&dlg_layout, d, col, row),
+                        ui::hit_dialog_list(&dlg_layout, d, col, row),
+                    ),
+                    None => (None, None),
+                };
+                if let Some(side) = side_hit {
+                    app.dialog_goto_sidebar(side);
+                    return;
+                }
+                if let Some(idx) = list_hit {
+                    let already =
+                        app.file_dialog.as_ref().and_then(|d| d.selected) == Some(idx);
+                    if already {
+                        // Re-click: files confirm in Open pickers, folders
+                        // descend; a file in a save picker just keeps its
+                        // selection (the Save button confirms).
+                        if dialog_selected_is_file(app) {
+                            if dialog_is_open_mode(app) {
+                                app.dialog_confirm();
+                            }
+                        } else {
+                            app.dialog_enter();
+                        }
+                    } else if let Some(d) = app.file_dialog.as_mut() {
+                        // `FileDialog.selected` is pub: set the highlight
+                        // directly instead of stepping through the list.
+                        d.selected = Some(idx);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     match kind {
         MouseEventKind::Down(MouseButton::Left) => {
             if let Some(action) = ui::hit_menu(areas, col, row) {
                 match action {
-                    ui::MenuAction::New => app.new_file(),
+                    ui::MenuAction::New => app.open_save_new_dialog(),
                     ui::MenuAction::Save => app.menu_save(),
-                    ui::MenuAction::Load => app.start_prompt(app::PromptKind::Load),
+                    ui::MenuAction::Load => app.open_load_dialog(),
                 }
                 return;
             }
             if let Some(row_idx) = ui::hit_colors(areas, app, col, row) {
-                // Row 0 is transparent-background; rows 1–16 are ANSI 0–15.
-                if row_idx == 0 {
-                    app.set_status("transparent applies to background (right-click)");
-                } else {
-                    app.set_fg(row_idx as i8 - 1);
+                match theme::color_rows(theme).get(row_idx) {
+                    Some(theme::ColorRow::Header(name)) => {
+                        app.set_status(format!(
+                            "{name}: left-click sets fg, right-click sets bg"
+                        ));
+                    }
+                    Some(theme::ColorRow::Transparent) => {
+                        app.set_status("transparent applies to background (right-click)");
+                    }
+                    Some(theme::ColorRow::Entry { group, index }) => {
+                        if let Some(color) = color_at(theme, *group, *index) {
+                            app.set_fg(color);
+                        }
+                    }
+                    None => {}
                 }
                 return;
             }
@@ -412,8 +540,16 @@ fn handle_mouse(
         }
         MouseEventKind::Down(MouseButton::Right) => {
             if let Some(row_idx) = ui::hit_colors(areas, app, col, row) {
-                // Right-click sets the background pot (row 0 = transparent).
-                app.set_bg(row_idx as i8 - 1);
+                // Right-click sets the background pot (Transparent = none).
+                match theme::color_rows(theme).get(row_idx) {
+                    Some(theme::ColorRow::Transparent) => app.set_bg(None),
+                    Some(theme::ColorRow::Entry { group, index }) => {
+                        if let Some(color) = color_at(theme, *group, *index) {
+                            app.set_bg(Some(color));
+                        }
+                    }
+                    Some(theme::ColorRow::Header(_)) | None => {}
+                }
                 return;
             }
             if let Some(pos) = ui::hit_canvas(areas, app, col, row) {
@@ -445,7 +581,8 @@ fn handle_mouse(
                     areas.palette_grid.height as usize,
                 );
             } else if ui::over_colors(areas, col, row) {
-                app.scroll_colors(1, areas.colors.height as usize);
+                let total = theme::color_rows(theme).len();
+                app.scroll_colors(1, total, areas.colors.height as usize);
             } else if ui::over_canvas(areas, col, row) {
                 // Infinite scroll: wheel pans (Shift+wheel goes horizontal).
                 if shift {
@@ -463,7 +600,8 @@ fn handle_mouse(
                     areas.palette_grid.height as usize,
                 );
             } else if ui::over_colors(areas, col, row) {
-                app.scroll_colors(-1, areas.colors.height as usize);
+                let total = theme::color_rows(theme).len();
+                app.scroll_colors(-1, total, areas.colors.height as usize);
             } else if ui::over_canvas(areas, col, row) {
                 if shift {
                     app.viewport.0 -= 3;
@@ -502,6 +640,8 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
     let arg_path = std::env::args().nth(1).map(PathBuf::from);
     let (doc, file_path) = open_or_create(arg_path);
     let mut app = App::new(doc, file_path);
+    // Main owns the theme instance for the whole loop: canvas styles and
+    // the Colors-panel rows/groups all resolve against it.
     let theme = theme::load();
 
     terminal::enable_raw_mode()?;
@@ -528,8 +668,9 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 handle_key(&mut app, k.code, k.modifiers);
             }
             Event::Mouse(m) => {
-                let areas = ui::compute_layout(term_area(tw, th), app.doc.layers.len());
-                handle_mouse(&mut app, &areas, m.kind, m.column, m.row, m.modifiers);
+                let term = term_area(tw, th);
+                let areas = ui::compute_layout(term, app.doc.layers.len());
+                handle_mouse(&mut app, &areas, term, &theme, m.kind, m.column, m.row, m.modifiers);
             }
             Event::Resize(w, h) => {
                 tw = w;

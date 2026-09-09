@@ -7,3 +7,4 @@ pub mod model;
 pub mod draw;
 pub mod theme;
 pub mod clipboard;
+pub mod chars;

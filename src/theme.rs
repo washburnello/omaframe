@@ -25,6 +25,8 @@ use std::path::PathBuf;
 
 use ratatui::style::{Color, Style};
 
+use crate::model::PaintColor;
+
 /// App-chrome theme plus the 16 wireframe palette slots.
 ///
 /// `bg/fg/accent/dim/highlight` paint chrome; `ansi[0..16]` paints canvas
@@ -43,6 +45,14 @@ pub struct Theme {
     pub highlight: Color,
     /// Omarchy `color0–15` (wireframe palette slots).
     pub ansi: [Color; 16],
+    /// RGB snapshots of the extended `colors.toml` role keys, parsed at
+    /// load ([`load`] / [`from_toml_str`]) for the Colors panel groups
+    /// (Backgrounds, Foregrounds, Accent, Colors, Brights). Keys are the
+    /// lowercase TOML names (`"dark_background"`, `"bright_red"`, …);
+    /// values are always [`PaintColor::Rgb`]. Missing/unparseable keys are
+    /// simply absent — [`color_groups`] falls back to the role fields and
+    /// [`defaults`] above.
+    pub snapshots: HashMap<String, PaintColor>,
 }
 
 /// Built-in picotron-dark defaults (plan §2.4).
@@ -76,6 +86,7 @@ pub fn defaults() -> Theme {
             Color::Rgb(0x89, 0xdc, 0xeb), // 14 Sky
             Color::Rgb(0xcd, 0xd6, 0xf4), // 15 Text (= fg)
         ],
+        snapshots: HashMap::new(),
     }
 }
 
@@ -250,6 +261,7 @@ pub fn from_toml_str(s: &str) -> Theme {
     let mut theme = defaults();
     let kv = parse_toml_kv(s);
     apply_kv(&mut theme, &kv);
+    theme.snapshots = capture_snapshots(&kv);
     theme
 }
 
@@ -391,6 +403,7 @@ pub fn load() -> Theme {
         if let Ok(text) = std::fs::read_to_string(&path) {
             let kv = parse_toml_kv(&text);
             apply_kv(&mut theme, &kv);
+            theme.snapshots = capture_snapshots(&kv);
         }
     }
     theme
@@ -398,25 +411,282 @@ pub fn load() -> Theme {
 
 /// Ratatui style for a canvas cell.
 ///
-/// `fg`/`bg` are ANSI slot indices into [`Theme::ansi`]. `bg == -1`
+/// `fg` resolves against [`Theme::ansi`] via [`resolve`]; `bg == None`
 /// means transparent: the preview surface shows through (dark → theme
-/// bg, light → theme fg per `preview_dark`). Out-of-range indices fall
-/// back tolerantly (`fg` → theme fg, `bg` → preview bg) and never panic.
-pub fn cell_style(fg: i8, bg: i8, theme: &Theme, preview_dark: bool) -> Style {
-    let fg_color = if (0..16).contains(&fg) {
-        theme.ansi[fg as usize]
-    } else {
-        theme.fg
-    };
+/// bg, light → theme fg per `preview_dark`). Never panics.
+pub fn cell_style(
+    fg: PaintColor,
+    bg: Option<PaintColor>,
+    theme: &Theme,
+    preview_dark: bool,
+) -> Style {
     let preview_bg = if preview_dark { theme.bg } else { theme.fg };
-    let bg_color = if bg == -1 {
-        preview_bg
-    } else if (0..16).contains(&bg) {
-        theme.ansi[bg as usize]
-    } else {
-        preview_bg
+    let bg_color = bg.map(|c| resolve(c, theme)).unwrap_or(preview_bg);
+    Style::default().fg(resolve(fg, theme)).bg(bg_color)
+}
+
+// ---------------------------------------------------------------------------
+// Colors panel groups (truecolor migration)
+// ---------------------------------------------------------------------------
+
+/// Resolve a paint color against the theme: ANSI slots read the live
+/// [`Theme::ansi`] entry (out-of-range slots fall back to theme fg, never
+/// panic); RGB triples are frozen truecolor.
+pub fn resolve(p: PaintColor, theme: &Theme) -> Color {
+    match p {
+        PaintColor::Ansi(i) => theme.ansi.get(i as usize).copied().unwrap_or(theme.fg),
+        PaintColor::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
+}
+
+/// View a [`Color`] as a [`PaintColor`] (theme roles are opaque Rgb in
+/// practice; anything else degrades to a neutral slot, never panics).
+fn paint_of(c: Color) -> PaintColor {
+    match c {
+        Color::Rgb(r, g, b) => PaintColor::Rgb(r, g, b),
+        Color::Indexed(i) => PaintColor::Ansi(i.min(15)),
+        _ => PaintColor::Ansi(7),
+    }
+}
+
+/// One Colors-panel group: theme-role snapshots or a constant bonus
+/// palette (Pico-8, Picotron).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColorGroup {
+    pub name: String,
+    pub entries: Vec<ColorEntry>,
+}
+
+/// One swatch: display label plus the paint color it applies.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColorEntry {
+    pub label: String,
+    pub color: PaintColor,
+}
+
+/// One clickable Colors-panel row: a group header, the transparent
+/// ("none") background row, or a swatch entry (`group`/`index` address
+/// [`color_groups`] output).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ColorRow {
+    Header(String),
+    Transparent,
+    Entry { group: usize, index: usize },
+}
+
+/// TOML keys snapshotted for the Colors panel (union of the Backgrounds,
+/// Foregrounds, Accent, Colors, and Brights group keys). Only
+/// successfully-parsed hex values are stored; anything missing falls back
+/// per [`color_groups`].
+const SNAPSHOT_KEYS: [&str; 25] = [
+    "background",
+    "dark_background",
+    "darker_background",
+    "lighter_background",
+    "foreground",
+    "dark_foreground",
+    "light_foreground",
+    "bright_foreground",
+    "accent",
+    "selection",
+    "muted",
+    "red",
+    "orange",
+    "yellow",
+    "green",
+    "cyan",
+    "blue",
+    "magenta",
+    "brown",
+    "bright_red",
+    "bright_green",
+    "bright_yellow",
+    "bright_blue",
+    "bright_magenta",
+    "bright_cyan",
+];
+
+/// Collect the parsed RGB snapshots out of a `colors.toml` key map
+/// (malformed values are skipped so the caller falls back).
+fn capture_snapshots(kv: &HashMap<String, String>) -> HashMap<String, PaintColor> {
+    let mut out = HashMap::new();
+    for key in SNAPSHOT_KEYS {
+        if let Some(c) = kv.get(key).and_then(|v| parse_hex_color(v)) {
+            out.insert(key.to_string(), paint_of(c));
+        }
+    }
+    out
+}
+
+/// Snapshot entry helper: `(label, toml key, theme fallback)`.
+fn snap(
+    theme: &Theme,
+    label: &str,
+    key: &str,
+    fallback: Color,
+) -> ColorEntry {
+    let color = theme
+        .snapshots
+        .get(key)
+        .copied()
+        .unwrap_or_else(|| paint_of(fallback));
+    ColorEntry {
+        label: label.to_string(),
+        color,
+    }
+}
+
+/// Pico-8 standard palette (constant bonus table): `(name, hex)` in slot
+/// order 0–15.
+const PICO8: [(&str, &str); 16] = [
+    ("black", "#000000"),
+    ("dark-blue", "#1d2b53"),
+    ("dark-purple", "#7e2553"),
+    ("dark-green", "#008751"),
+    ("brown", "#ab5236"),
+    ("dark-gray", "#5f574f"),
+    ("light-gray", "#c2c3c7"),
+    ("white", "#fff1e8"),
+    ("red", "#ff004d"),
+    ("orange", "#ffa300"),
+    ("yellow", "#ffec27"),
+    ("green", "#00e436"),
+    ("blue", "#29adff"),
+    ("lavender", "#83769c"),
+    ("pink", "#ff77a8"),
+    ("peach", "#ffccaa"),
+];
+
+/// Picotron secondary palette (constant bonus table): the 16
+/// Picotron-exclusive system colors after the Pico-8-compatible first 16
+/// (`#1c5eac`…`#ff856d`).
+const PICOTRON: [(&str, &str); 16] = [
+    ("royal-blue", "#1c5eac"),
+    ("teal", "#00a5a1"),
+    ("purple", "#754e97"),
+    ("deep-teal", "#125359"),
+    ("brick", "#742f29"),
+    ("coffee", "#492d38"),
+    ("tan", "#a28879"),
+    ("light-pink", "#ffacc5"),
+    ("crimson", "#c3004c"),
+    ("orange", "#eb6b00"),
+    ("lime", "#90ec42"),
+    ("green", "#00b251"),
+    ("sky", "#64dff6"),
+    ("lilac", "#bd9adf"),
+    ("magenta", "#e40dab"),
+    ("salmon", "#ff856d"),
+];
+
+/// Colors-panel groups in display order: Backgrounds, Foregrounds, Accent,
+/// Colors, Brights, Pico-8, Picotron.
+///
+/// The first five groups are RGB snapshots parsed from the active
+/// `colors.toml` at load; missing keys fall back to the current role
+/// fields (chromatic colors without a role field fall back to the nearest
+/// live ANSI slot: `orange → ansi[10]`, `brown → ansi[1]`; brights fall
+/// back to `ansi[9–14]`). Pico-8 and Picotron are constant tables.
+pub fn color_groups(theme: &Theme) -> Vec<ColorGroup> {
+    let backgrounds = ColorGroup {
+        name: "Backgrounds".to_string(),
+        entries: vec![
+            snap(theme, "background", "background", theme.bg),
+            snap(theme, "dark background", "dark_background", theme.bg),
+            snap(theme, "darker background", "darker_background", theme.bg),
+            snap(theme, "lighter background", "lighter_background", theme.bg),
+        ],
     };
-    Style::default().fg(fg_color).bg(bg_color)
+    let foregrounds = ColorGroup {
+        name: "Foregrounds".to_string(),
+        entries: vec![
+            snap(theme, "foreground", "foreground", theme.fg),
+            snap(theme, "dark foreground", "dark_foreground", theme.fg),
+            snap(theme, "light foreground", "light_foreground", theme.fg),
+            snap(theme, "bright foreground", "bright_foreground", theme.fg),
+        ],
+    };
+    let accent = ColorGroup {
+        name: "Accent".to_string(),
+        entries: vec![
+            snap(theme, "accent", "accent", theme.accent),
+            snap(theme, "selection", "selection", theme.highlight),
+            snap(theme, "muted", "muted", theme.dim),
+        ],
+    };
+    let colors = ColorGroup {
+        name: "Colors".to_string(),
+        entries: vec![
+            snap(theme, "red", "red", theme.ansi[1]),
+            snap(theme, "orange", "orange", theme.ansi[10]),
+            snap(theme, "yellow", "yellow", theme.ansi[3]),
+            snap(theme, "green", "green", theme.ansi[2]),
+            snap(theme, "cyan", "cyan", theme.ansi[6]),
+            snap(theme, "blue", "blue", theme.ansi[4]),
+            snap(theme, "magenta", "magenta", theme.ansi[5]),
+            snap(theme, "brown", "brown", theme.ansi[1]),
+        ],
+    };
+    let brights = ColorGroup {
+        name: "Brights".to_string(),
+        entries: vec![
+            snap(theme, "bright red", "bright_red", theme.ansi[9]),
+            snap(theme, "bright green", "bright_green", theme.ansi[10]),
+            snap(theme, "bright yellow", "bright_yellow", theme.ansi[11]),
+            snap(theme, "bright blue", "bright_blue", theme.ansi[12]),
+            snap(theme, "bright magenta", "bright_magenta", theme.ansi[13]),
+            snap(theme, "bright cyan", "bright_cyan", theme.ansi[14]),
+        ],
+    };
+    let pico8 = ColorGroup {
+        name: "Pico-8".to_string(),
+        entries: PICO8
+            .iter()
+            .map(|(label, hex)| ColorEntry {
+                label: label.to_string(),
+                color: PaintColor::from_hex(hex)
+                    .expect("Pico-8 table holds valid hex"),
+            })
+            .collect(),
+    };
+    let picotron = ColorGroup {
+        name: "Picotron".to_string(),
+        entries: PICOTRON
+            .iter()
+            .map(|(label, hex)| ColorEntry {
+                label: label.to_string(),
+                color: PaintColor::from_hex(hex)
+                    .expect("Picotron table holds valid hex"),
+            })
+            .collect(),
+    };
+    vec![
+        backgrounds,
+        foregrounds,
+        accent,
+        colors,
+        brights,
+        pico8,
+        picotron,
+    ]
+}
+
+/// Clickable Colors-panel rows in display order: each group's header, its
+/// entries — plus the transparent ("none") background row directly under
+/// the Backgrounds header (the old row-0 semantics).
+pub fn color_rows(theme: &Theme) -> Vec<ColorRow> {
+    let groups = color_groups(theme);
+    let mut rows = Vec::new();
+    for (gi, g) in groups.iter().enumerate() {
+        rows.push(ColorRow::Header(g.name.clone()));
+        if gi == 0 {
+            rows.push(ColorRow::Transparent);
+        }
+        for (ei, _) in g.entries.iter().enumerate() {
+            rows.push(ColorRow::Entry { group: gi, index: ei });
+        }
+    }
+    rows
 }
 
 #[cfg(test)]
@@ -496,7 +766,7 @@ color3 = "#008751" # trailing comment
     }
 
     #[test]
-    fn hex_forms_and_cell_style() {
+    fn hex_forms_resolve_and_cell_style() {
         assert_eq!(parse_hex_color("#fff"), Some(Color::Rgb(0xff, 0xff, 0xff)));
         assert_eq!(parse_hex_color("#000000"), Some(Color::Rgb(0, 0, 0)));
         assert_eq!(parse_hex_color("89b4fa"), Some(Color::Rgb(0x89, 0xb4, 0xfa)));
@@ -505,18 +775,158 @@ color3 = "#008751" # trailing comment
         assert_eq!(parse_hex_color(""), None);
 
         let t = defaults();
-        // Indexed slots resolve; bg -1 follows the preview flag.
-        let s = cell_style(4, -1, &t, true);
+        // ANSI slots resolve live; RGB triples pass through frozen.
+        assert_eq!(resolve(PaintColor::Ansi(4), &t), t.ansi[4]);
+        assert_eq!(
+            resolve(PaintColor::Rgb(1, 2, 3), &t),
+            Color::Rgb(1, 2, 3)
+        );
+        // Out-of-range slots degrade to theme fg, never panic.
+        assert_eq!(resolve(PaintColor::Ansi(99), &t), t.fg);
+
+        // Transparent bg follows the preview flag.
+        let s = cell_style(PaintColor::Ansi(4), None, &t, true);
         assert_eq!(s.fg, Some(t.ansi[4]));
         assert_eq!(s.bg, Some(t.bg));
-        let s2 = cell_style(4, -1, &t, false);
+        let s2 = cell_style(PaintColor::Ansi(4), None, &t, false);
         assert_eq!(s2.bg, Some(t.fg));
-        let s3 = cell_style(1, 2, &t, true);
+        let s3 = cell_style(
+            PaintColor::Ansi(1),
+            Some(PaintColor::Ansi(2)),
+            &t,
+            true,
+        );
         assert_eq!(s3.fg, Some(t.ansi[1]));
         assert_eq!(s3.bg, Some(t.ansi[2]));
-        // Out-of-range indices degrade gracefully, never panic.
-        let s4 = cell_style(99, 99, &t, true);
-        assert_eq!(s4.fg, Some(t.fg));
-        assert_eq!(s4.bg, Some(t.bg));
+        // Frozen RGB paints exactly.
+        let s4 = cell_style(
+            PaintColor::Rgb(0xff, 0, 0x4d),
+            Some(PaintColor::Rgb(0, 0, 0)),
+            &t,
+            true,
+        );
+        assert_eq!(s4.fg, Some(Color::Rgb(0xff, 0, 0x4d)));
+        assert_eq!(s4.bg, Some(Color::Rgb(0, 0, 0)));
+    }
+
+    #[test]
+    fn color_group_count_and_names() {
+        let groups = color_groups(&defaults());
+        let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "Backgrounds",
+                "Foregrounds",
+                "Accent",
+                "Colors",
+                "Brights",
+                "Pico-8",
+                "Picotron"
+            ]
+        );
+        assert_eq!(groups[0].entries.len(), 4);
+        assert_eq!(groups[1].entries.len(), 4);
+        assert_eq!(groups[2].entries.len(), 3);
+        assert_eq!(groups[3].entries.len(), 8);
+        assert_eq!(groups[4].entries.len(), 6);
+        assert_eq!(groups[5].entries.len(), 16);
+        assert_eq!(groups[6].entries.len(), 16);
+    }
+
+    #[test]
+    fn snapshots_override_and_missing_keys_fall_back() {
+        // Empty input: snapshots stay empty, groups fall back to role fields.
+        let t = from_toml_str("");
+        assert!(t.snapshots.is_empty());
+        let groups = color_groups(&t);
+        assert_eq!(
+            groups[0].entries[0].color,
+            paint_of(t.bg),
+            "missing background falls back to theme bg"
+        );
+        assert_eq!(groups[1].entries[0].color, paint_of(t.fg));
+        assert_eq!(groups[2].entries[0].color, paint_of(t.accent));
+
+        // Present keys become frozen RGB snapshots.
+        let t2 = from_toml_str(
+            "background = \"#112233\"\nred = \"#ff004d\"\nnot-a-key = \"#abcdef\"\n",
+        );
+        let g2 = color_groups(&t2);
+        assert_eq!(
+            g2[0].entries[0].color,
+            PaintColor::Rgb(0x11, 0x22, 0x33)
+        );
+        assert_eq!(
+            g2[3].entries[0].color,
+            PaintColor::Rgb(0xff, 0, 0x4d)
+        );
+        // Malformed values are skipped (fall back, never crash).
+        let t3 = from_toml_str("background = \"nope\"\n");
+        assert_eq!(
+            color_groups(&t3)[0].entries[0].color,
+            paint_of(t3.bg)
+        );
+    }
+
+    #[test]
+    fn pico8_first_last_hex() {
+        let groups = color_groups(&defaults());
+        let pico = &groups[5];
+        assert_eq!(pico.name, "Pico-8");
+        assert_eq!(pico.entries.len(), 16);
+        assert_eq!(pico.entries[0].label, "black");
+        assert_eq!(pico.entries[0].color, PaintColor::Rgb(0, 0, 0));
+        assert_eq!(pico.entries[15].label, "peach");
+        assert_eq!(pico.entries[15].color, PaintColor::Rgb(0xff, 0xcc, 0xaa));
+    }
+
+    #[test]
+    fn picotron_count_first_last() {
+        let groups = color_groups(&defaults());
+        let pt = &groups[6];
+        assert_eq!(pt.name, "Picotron");
+        assert_eq!(pt.entries.len(), 16);
+        assert_eq!(pt.entries[0].color, PaintColor::Rgb(0x1c, 0x5e, 0xac));
+        assert_eq!(pt.entries[15].color, PaintColor::Rgb(0xff, 0x85, 0x6d));
+    }
+
+    #[test]
+    fn color_rows_shape() {
+        let t = defaults();
+        let rows = color_rows(&t);
+        // 7 headers + Transparent + 57 entries.
+        assert_eq!(rows.len(), 7 + 1 + 57);
+        assert_eq!(
+            rows[0],
+            ColorRow::Header("Backgrounds".to_string())
+        );
+        assert_eq!(rows[1], ColorRow::Transparent);
+        assert_eq!(
+            rows[2],
+            ColorRow::Entry { group: 0, index: 0 }
+        );
+        // Every entry addresses a real swatch.
+        let groups = color_groups(&t);
+        for r in &rows {
+            if let ColorRow::Entry { group, index } = r {
+                assert!(
+                    groups.get(*group).and_then(|g| g.entries.get(*index)).is_some(),
+                    "dangling entry {group}/{index}"
+                );
+            }
+        }
+        // Headers name the groups in order.
+        let headers: Vec<String> = rows
+            .iter()
+            .filter_map(|r| match r {
+                ColorRow::Header(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            headers,
+            ["Backgrounds", "Foregrounds", "Accent", "Colors", "Brights", "Pico-8", "Picotron"]
+        );
     }
 }

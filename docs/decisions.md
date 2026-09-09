@@ -35,7 +35,33 @@ from `docs/tools-spec.md` and `skills/omaframe/` so Wave 2 agents are unblocked.
   SKILL.md §2 wording; demo unaffected). SKILL.md to be amended in Wave 2
   if the skill agent's text and model diverge anywhere else.
 
-## Wave 5: updated wireframe (corners, arrows, Layers panel)
+## Wave 6: truecolor, grouped Colors, file dialog, extended chars
+
+- **PaintColor**: cells are `fg: PaintColor` (`Ansi(u8)` live theme slot |
+  `Rgb` frozen) + `bg: Option<PaintColor>` (`None` = transparent). Files
+  store ints (legacy, `-1` = transparent, still written for stability) or
+  `#rrggbb`. ANSI export uses `38;2`/`48;2` for RGB. Two model rules worth
+  remembering: (1) palette swatches are frozen RGB snapshots, canvas ANSI
+  slots stay live; (2) theme switching mid-session needs a restart (theme
+  loads once at startup — watcher is future work).
+- **Grouped Colors**: Backgrounds / Foregrounds / Accent / Colors /
+  Brights (theme snapshots) + Pico-8 + Picotron (constants). Headers scroll
+  with rows; F/B/# markers; left=fg, right=bg.
+- **macOS-style files**: New asks for a path FIRST (Save dialog), then
+  every stroke/text/undo/redo/delete autosaves. Ctrl-S = explicit save.
+  Inline path prompt deleted, replaced by the modal.
+- **File dialog**: centered modal, Cancel / +Folder (auto-numbered) /
+  Open|Save buttons, editable path row, Places sidebar (nerd glyphs,
+  existing dirs), Name/Size/Type/Modified list (dirs + *.omaframe.json),
+  click-select + click-again confirms, Enter/Esc/Up/Down/Backspace/Alt+Up.
+- **Chars**: Symbols 32→100 (arrows, triangles, bullets, suits, checks,
+  math), Outlines 27→41, Blocks 21→29; width-1 enforced by test,
+  fontconfig spot-checked, zero drops.
+- **Chrome**: active tool `►`, `Size:WxH` in canvas bottom border,
+  palette ▲▼ paging.
+- QA: 73 tests, clippy clean, golden intact, menu build reinstalled.
+- Known gaps: no Colors ▲▼ affordance; orange/brown unmapped; theme
+  watcher; widget stamps; command palette.
 
 - **Corner-flanked titles** everywhere: `┌─┐Tools┌──`, menu
   `┌─┐New┌─┐Save┌─┐Load┌──`, canvas `┌─┐0,0┌──` (click rects re-derived
