@@ -35,6 +35,7 @@ const MENU_H: u16 = 3;
 pub enum MenuAction {
     New,
     Save,
+    SaveAs,
     Load,
 }
 
@@ -50,6 +51,7 @@ pub struct LayoutAreas {
     pub menu_top: Rect,
     pub menu_new: Rect,
     pub menu_save: Rect,
+    pub menu_saveas: Rect,
     pub menu_load: Rect,
     pub tools: Rect,
     pub colors: Rect,
@@ -123,11 +125,12 @@ pub fn compute_layout(area: Rect, n_layers: usize, tab: usize) -> LayoutAreas {
         menu_outer.width.saturating_sub(2),
         1,
     );
-    // Menu items live in the top border (`┌─┐New┌─┐Save┌─┐Load┌──…`):
+    // Menu items live in the top border (`┌─┐New┌─┐Save┌─┐SaveAs┌─┐Load┌──…`):
     // fixed offsets from the outer left edge.
     let menu_new = Rect::new(menu_outer.x + 3, menu_outer.y, 3, 1);
     let menu_save = Rect::new(menu_outer.x + 9, menu_outer.y, 4, 1);
-    let menu_load = Rect::new(menu_outer.x + 16, menu_outer.y, 4, 1);
+    let menu_saveas = Rect::new(menu_outer.x + 16, menu_outer.y, 6, 1);
+    let menu_load = Rect::new(menu_outer.x + 25, menu_outer.y, 4, 1);
     let canvas_outer = Rect::new(
         center_outer.x,
         menu_outer.y + menu_outer.height,
@@ -181,6 +184,7 @@ pub fn compute_layout(area: Rect, n_layers: usize, tab: usize) -> LayoutAreas {
         menu_top,
         menu_new,
         menu_save,
+        menu_saveas,
         menu_load,
         tools,
         colors,
@@ -381,12 +385,14 @@ pub fn hit_layer_row(
     Some((idx, eye))
 }
 
-/// Map a click in the menu top border to New/Save/Load.
+/// Map a click in the menu top border to New/Save/SaveAs/Load.
 pub fn hit_menu(areas: &LayoutAreas, col: u16, row: u16) -> Option<MenuAction> {
     if contains(areas.menu_new, col, row) {
         Some(MenuAction::New)
     } else if contains(areas.menu_save, col, row) {
         Some(MenuAction::Save)
+    } else if contains(areas.menu_saveas, col, row) {
+        Some(MenuAction::SaveAs)
     } else if contains(areas.menu_load, col, row) {
         Some(MenuAction::Load)
     } else {
@@ -771,7 +777,7 @@ fn render_menu(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme) 
     let w = areas.menu_top.width as usize;
     let dim = Style::default().fg(t.dim);
     let item = Style::default().fg(t.fg).add_modifier(Modifier::BOLD);
-    // Wireframe menu chrome (`┌─┐New┌─┐Save┌─┐Load┌──…`): the label spans
+    // Wireframe menu chrome (`┌─┐New┌─┐Save┌─┐SaveAs┌─┐Load┌──…`): the label spans
     // below must reproduce these offsets exactly for click mapping.
     let mut spans = vec![
         Span::styled("┌─┐", dim),
@@ -779,10 +785,12 @@ fn render_menu(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme) 
         Span::styled("┌─┐", dim),
         Span::styled("Save", item),
         Span::styled("┌─┐", dim),
+        Span::styled("SaveAs", item),
+        Span::styled("┌─┐", dim),
         Span::styled("Load", item),
         Span::styled("┌", dim),
     ];
-    let used: usize = "┌─┐New┌─┐Save┌─┐Load┌".chars().count();
+    let used: usize = "┌─┐New┌─┐Save┌─┐SaveAs┌─┐Load┌".chars().count();
     if w + 2 > used {
         spans.push(Span::styled(
             "─".repeat(w + 2 - used - 1) + "┐",
@@ -1674,9 +1682,11 @@ mod tests {
         assert_eq!((a.menu_new.x, a.menu_new.y), (a.menu_top.x + 2, a.menu_top.y));
         assert_eq!(a.menu_new.width, 3);
         assert_eq!((a.menu_save.x, a.menu_save.width), (a.menu_top.x + 8, 4));
-        assert_eq!((a.menu_load.x, a.menu_load.width), (a.menu_top.x + 15, 4));
+        assert_eq!((a.menu_saveas.x, a.menu_saveas.width), (a.menu_top.x + 15, 6));
+        assert_eq!((a.menu_load.x, a.menu_load.width), (a.menu_top.x + 24, 4));
         assert_eq!(hit_menu(&a, a.menu_new.x + 1, a.menu_new.y), Some(MenuAction::New));
         assert_eq!(hit_menu(&a, a.menu_save.x, a.menu_save.y), Some(MenuAction::Save));
+        assert_eq!(hit_menu(&a, a.menu_saveas.x + 2, a.menu_saveas.y), Some(MenuAction::SaveAs));
         assert_eq!(hit_menu(&a, a.menu_load.x + 3, a.menu_load.y), Some(MenuAction::Load));
         assert_eq!(hit_menu(&a, 0, 0), None);
         // Tools: 11 rows; colors panel directly below the tools box.
@@ -1994,14 +2004,14 @@ mod tests {
                     modified: "2d ago".to_string(),
                 },
                 DirEntry {
-                    name: "a.omaframe.json".to_string(),
+                    name: "a.oframe".to_string(),
                     is_dir: false,
                     size: 2048,
                     modified: "5m ago".to_string(),
                 },
             ],
             selected: Some(1),
-            filename: "new.omaframe.json".to_string(),
+            filename: "new.oframe".to_string(),
             sidebar: vec![
                 ("Home".to_string(), "D".to_string(), PathBuf::from("/home/u")),
                 ("Root".to_string(), "D".to_string(), PathBuf::from("/")),
@@ -2082,8 +2092,8 @@ mod tests {
             "+Folder",
             "Places",
             "Name",
-            "new.omaframe.json",
-            "a.omaframe.json",
+            "new.oframe",
+            "a.oframe",
             "docs",
             "Home",
         ] {
@@ -2095,7 +2105,7 @@ mod tests {
         let screen = screen_text(&render_to_buf(&mut app, &t));
         assert!(screen.contains("Open"), "missing Open:\n{screen}");
         assert!(
-            screen.contains("a.omaframe.json"),
+            screen.contains("a.oframe"),
             "missing selected name:\n{screen}"
         );
     }

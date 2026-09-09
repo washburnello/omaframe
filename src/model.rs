@@ -86,7 +86,11 @@ pub const MAX_GRID_W: u32 = 500;
 /// clips at render time.
 pub const MAX_GRID_H: u32 = 200;
 
-/// Current `.omaframe.json` format version. Anything else fails to load.
+/// File extension for wireframe documents (hard cutover: the loader
+/// refuses anything else).
+pub const FILE_EXTENSION: &str = "oframe";
+
+/// Current `.oframe` format version. Anything else fails to load.
 pub const FILE_VERSION: u32 = 1;
 
 // ---------------------------------------------------------------------------
@@ -116,7 +120,7 @@ pub enum ModelError {
 impl fmt::Display for ModelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::BadVersion(v) => write!(f, "unsupported .omaframe.json version {v} (want 1)"),
+            Self::BadVersion(v) => write!(f, "unsupported .oframe version {v} (want 1)"),
             Self::BadColor(msg) => {
                 write!(f, "bad color {msg} (want fg 0-15 or #rrggbb, bg -1-15 or #rrggbb)")
             }
@@ -893,7 +897,7 @@ impl History {
 }
 
 // ---------------------------------------------------------------------------
-// File format (.omaframe.json read/write)
+// File format (.oframe read/write)
 // ---------------------------------------------------------------------------
 
 /// Wire color: an ANSI index or a `#rrggbb` string (untagged, so old
@@ -1199,7 +1203,7 @@ fn document_to_file_doc(doc: &Document) -> Result<FileDoc, ModelError> {
     })
 }
 
-/// Parse `.omaframe.json` text into a [`Document`] (schema:
+/// Parse `.oframe` text into a [`Document`] (schema:
 /// `skills/omaframe/schema.json`). See the module docs for tolerance
 /// (ignored unknown keys, soft grid cap, preserved out-of-grid coords)
 /// versus loud errors (version, colors, shapes).
@@ -1208,19 +1212,31 @@ pub fn load_json(s: &str) -> Result<Document, ModelError> {
     file_doc_to_document(fd)
 }
 
-/// Serialize a [`Document`] to canonical pretty `.omaframe.json` text
+/// Serialize a [`Document`] to canonical pretty `.oframe` text
 /// (deterministic: schema field order, cells sorted by `(y, x)`).
 pub fn save_json(doc: &Document) -> Result<String, ModelError> {
     let fd = document_to_file_doc(doc)?;
     Ok(serde_json::to_string_pretty(&fd)?)
 }
 
-/// Load a `.omaframe.json` file from disk.
+/// Load a `.oframe` file from disk. Hard cutover: any other extension is
+/// rejected before reading.
 pub fn load_file(path: impl AsRef<Path>) -> Result<Document, ModelError> {
+    let path = path.as_ref();
+    let is_oframe = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case(FILE_EXTENSION));
+    if !is_oframe {
+        return Err(ModelError::BadGrid(format!(
+            "not a .{FILE_EXTENSION} file: {}",
+            path.display()
+        )));
+    }
     load_json(&std::fs::read_to_string(path)?)
 }
 
-/// Save a [`Document`] to disk as `.omaframe.json`.
+/// Save a [`Document`] to disk as `.oframe`.
 pub fn save_file(doc: &Document, path: impl AsRef<Path>) -> Result<(), ModelError> {
     std::fs::write(path, save_json(doc)?)?;
     Ok(())
@@ -1762,7 +1778,7 @@ mod tests {
 
     #[test]
     fn golden_demo_export_is_byte_identical() {
-        let src = include_str!("../testdata/demo.omaframe.json");
+        let src = include_str!("../testdata/demo.oframe");
         let expected = include_str!("../testdata/demo.txt");
         let doc = load_json(src).expect("demo loads");
         assert_eq!(doc.grid, (40, 12));
@@ -1776,7 +1792,7 @@ mod tests {
 
     #[test]
     fn selection_export_clips_and_trims() {
-        let doc = load_json(include_str!("../testdata/demo.omaframe.json")).expect("demo");
+        let doc = load_json(include_str!("../testdata/demo.oframe")).expect("demo");
         // The "Settings" title span on the top border.
         let title = export_selection(&doc, &Rect::new(6, 0, 8, 1));
         assert_eq!(title, "Settings\n");
@@ -1897,7 +1913,7 @@ mod tests {
 
     #[test]
     fn markdown_export_wraps_txt() {
-        let doc = load_json(include_str!("../testdata/demo.omaframe.json")).expect("demo");
+        let doc = load_json(include_str!("../testdata/demo.oframe")).expect("demo");
         let md = export_md(&doc);
         assert!(md.starts_with("# settings-panel\n```text\n"));
         assert!(md.ends_with("```\n"));
@@ -1906,7 +1922,7 @@ mod tests {
 
     #[test]
     fn ansi_export_strips_back_to_txt() {
-        let doc = load_json(include_str!("../testdata/demo.omaframe.json")).expect("demo");
+        let doc = load_json(include_str!("../testdata/demo.oframe")).expect("demo");
         let ansi = export_ansi(&doc, &crate::theme::defaults());
         assert!(ansi.contains("\x1b["), "expected SGR codes");
         // Strip SGR sequences; what remains must equal plain export.

@@ -13,7 +13,7 @@
 //!
 //! The testable core is [`run`]: it performs load/export/`--to` write/
 //! `--copy` and returns the exported text, so `cargo test` can assert the
-//! golden `testdata/demo.omaframe.json --export txt == testdata/demo.txt`
+//! golden `testdata/demo.oframe --export txt == testdata/demo.txt`
 //! without spawning a subprocess.
 
 use omaframe::clipboard;
@@ -267,7 +267,7 @@ mod tests {
 
     fn demo_json() -> String {
         manifest_dir()
-            .join("testdata/demo.omaframe.json")
+            .join("testdata/demo.oframe")
             .to_string_lossy()
             .to_string()
     }

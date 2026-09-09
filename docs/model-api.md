@@ -167,7 +167,7 @@ Hand edits to baked cells are overlay, never back-propagated (one-way).
   wide anchor (no orphans). Loading a file with overlapping wide anchors:
   last-writer-wins in file order, drop the orphaned anchor (document + test).
 
-## 8. `.omaframe.json` schema (v1, normative — plan §3.2 + §4.4)
+## 8. `.oframe` schema (v1, normative — plan §3.2 + §4.4)
 
 ```jsonc
 {
@@ -197,8 +197,8 @@ optional (default `[]`); `preview`/`paletteTab` optional hints (defaults
 `{dark:true}` / `"outlines"`); unknown top-level keys **ignored**
 (forward-compat, same tolerant policy as config/theme parsing).
 
-Canonical file ops: explicit save anywhere + autosave to
-`~/.local/share/omaframe/autosave/`; dirty dot + `Ctrl-S` (plan §5).
+Canonical file ops: explicit save anywhere (Ctrl-S / menu Save / Save As);
+no autosave — the dirty dot marks unwritten changes (plan §5).
 CLI: `--open F --export {txt,md,ansi} --to OUT [--selection x,y,w,h]`.
 
 ## 9. Export (character view of compose)
@@ -209,7 +209,7 @@ CLI: `--open F --export {txt,md,ansi} --to OUT [--selection x,y,w,h]`.
 - `.txt+ansi` / clipboard: same text with SGR escapes from fg/bg slots
   (`30–37/90–97`, bg `40–47/100–107`, `-1` = no code). Prefer `wl-copy`,
   fallback OSC52 (plan §5).
-- Snapshot tests: `testdata/*.omaframe.json → expected/*.txt` golden files
+- Snapshot tests: `testdata/*.oframe → expected/*.txt` golden files
   (plan §9) — the model crate must expose `export_txt(&Document) -> String`
   pure of all TUI state so tests don't boot Ratatui.
 

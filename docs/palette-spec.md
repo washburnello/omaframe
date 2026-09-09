@@ -187,7 +187,7 @@ hide_nerds = false          # one-click fallback when font lacks coverage
   appended in default order (forward-compatible). Never crash on a hand-edited
   config — fall back to defaults per-file-key with a status-bar notice
   (same tolerant-parse policy as theme loading, plan §10).
-- Per-file `paletteTab` (in `.omaframe.json`) overrides `active_tab` when a
+- Per-file `paletteTab` (in `.oframe`) overrides `active_tab` when a
   file is opened; closing/switching files restores the session tab.
 
 ## 6. Font test page + missing-glyph fallback (plan §4.7)

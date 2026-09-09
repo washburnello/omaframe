@@ -2,11 +2,11 @@
 # See plan.md §4.4 ("Widget stamps") and Appendix A.
 #
 # Each widget is a parametric entity ({kind, w, h, label, style}), not baked
-# chars, so resize/relabel works. Serialized in .omaframe.json as widgets[]
+# chars, so resize/relabel works. Serialized in .oframe as widgets[]
 # with a baked-cells fallback for export.
 #
 # Schema per [[widget]]:
-#   kind       entity name stored in .omaframe.json widgets[]
+#   kind       entity name stored in .oframe widgets[]
 #   label      default label text ({label} in templates)
 #   default_w  default width in cells (resize reflows borders, shifts label)
 #   default_h  default height in cells

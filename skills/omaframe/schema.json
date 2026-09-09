@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "omaframe wireframe",
-  "description": "Schema for .omaframe.json wireframe files (plan.md sections 3.2 and 4.4, Appendix C). A fixed cell grid with stacked sparse layers, plus optional parametric widgets and a dark/light preview hint.",
+  "description": "Schema for .oframe wireframe files (plan.md sections 3.2 and 4.4, Appendix C). A fixed cell grid with stacked sparse layers, plus optional parametric widgets and a dark/light preview hint.",
   "type": "object",
   "required": ["version", "name", "grid", "layers"],
   "additionalProperties": false,

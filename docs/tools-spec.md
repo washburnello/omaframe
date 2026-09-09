@@ -552,4 +552,4 @@ for text/select-keys). `move()`/`handleKey()`-typing never push.**
 - Pixel concepts (`font.ts`, DPR, zoom, pan offsets in `canvas.ts`) — gone.
   Viewport pan is in cells; there is no zoom (plan §3.3).
 - `localStorage` persistence + share-URL serialization — replaced by
-  `.omaframe.json` files (see `docs/model-api.md`).
+  `.oframe` files (see `docs/model-api.md`).

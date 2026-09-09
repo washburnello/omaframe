@@ -441,7 +441,7 @@ impl FileDialog {
     }
 
     /// Re-read `cwd`: directories first (alpha, case-insensitive), then
-    /// `*.omaframe.json` files (alpha, case-insensitive). Other files are
+    /// `*.oframe` files (alpha, case-insensitive). Other files are
     /// hidden. An out-of-range selection resets to `None`; a missing or
     /// unreadable `cwd` yields an empty list (never panics).
     pub fn refresh(&mut self) {
@@ -464,7 +464,7 @@ impl FileDialog {
                             .map(rel_time)
                             .unwrap_or_default(),
                     });
-                } else if name.ends_with(".omaframe.json") {
+                } else if name.ends_with(".oframe") {
                     let (size, modified) = ent
                         .metadata()
                         .ok()
@@ -607,8 +607,10 @@ impl FileDialog {
 
     /// The path to act on, or `None` when there is nothing valid to
     /// confirm: Open → the selected file (dirs / empty selection → `None`);
-    /// Save → `cwd/filename` when the filename is non-blank.
+    /// Save → `cwd/filename` with `.oframe` appended when the user typed
+    /// no (or another) extension.
     pub fn confirm_path(&self) -> Option<PathBuf> {
+        use omaframe::model::FILE_EXTENSION;
         match self.mode {
             DialogMode::Open => self
                 .selected
@@ -616,10 +618,17 @@ impl FileDialog {
                 .filter(|e| !e.is_dir)
                 .map(|e| self.cwd.join(&e.name)),
             DialogMode::Save => {
-                if self.filename.trim().is_empty() {
+                let name = self.filename.trim();
+                if name.is_empty() {
                     None
                 } else {
-                    Some(self.cwd.join(&self.filename))
+                    let mut p = PathBuf::from(name);
+                    if p.extension().and_then(|e| e.to_str())
+                        != Some(FILE_EXTENSION)
+                    {
+                        p.set_extension(FILE_EXTENSION);
+                    }
+                    Some(self.cwd.join(p))
                 }
             }
         }
@@ -655,6 +664,8 @@ pub struct App {
     pub file_path: Option<PathBuf>,
     pub dirty: bool,
     pub should_quit: bool,
+    pub last_dir: Option<PathBuf>,
+    pending_overwrite: Option<PathBuf>,
     anchor: Option<(i32, i32)>,
     drawing: bool,
     text_start: Option<(i32, i32)>,
@@ -691,6 +702,8 @@ impl App {
             file_path,
             dirty: false,
             should_quit: false,
+            last_dir: Self::read_lastdir(),
+            pending_overwrite: None,
             anchor: None,
             drawing: false,
             text_start: None,
@@ -1030,7 +1043,6 @@ impl App {
     pub fn undo(&mut self) {
         if self.history.undo(&mut self.doc) {
             self.dirty = true;
-            self.autosave();
             self.set_status("undo");
         } else {
             self.set_status("nothing to undo");
@@ -1040,7 +1052,6 @@ impl App {
     pub fn redo(&mut self) {
         if self.history.redo(&mut self.doc) {
             self.dirty = true;
-            self.autosave();
             self.set_status("redo");
         } else {
             self.set_status("nothing to redo");
@@ -1067,10 +1078,21 @@ impl App {
         }
     }
 
-    pub fn autosave(&mut self) {
-        if self.dirty && self.file_path.is_some() {
-            let _ = self.save();
+    /// Quit guard: clean docs quit immediately; dirty docs with a path
+    /// save first (staying put when the save fails); dirty pathless docs
+    /// open Save As instead of quitting so no work is silently lost.
+    pub fn request_quit(&mut self) {
+        if !self.dirty {
+            self.should_quit = true;
+            return;
         }
+        if self.file_path.is_some() {
+            if self.save() {
+                self.should_quit = true;
+            }
+            return;
+        }
+        self.open_save_as_dialog();
     }
 
     // --- colors panel (direct fg/bg pots) ---
@@ -1110,21 +1132,67 @@ impl App {
     }
 
     fn doc_name_for(path: &std::path::Path) -> String {
-        path.file_stem()
+        let file_name = path
+            .file_name()
             .and_then(|s| s.to_str())
-            .filter(|s| !s.is_empty())
-            .unwrap_or("untitled")
-            .to_string()
+            .unwrap_or("");
+        let stripped = file_name
+            .strip_suffix(".oframe")
+            .unwrap_or(file_name);
+        if stripped.is_empty() {
+            "untitled".to_string()
+        } else {
+            stripped.to_string()
+        }
     }
 
-    /// Dialog start dir: the bound file's parent, else `~/Documents` when it
-    /// exists, else `~` (else the process cwd).
+    /// Own config dir (`~/.config/omaframe`, `XDG_CONFIG_HOME`-aware).
+    fn config_dir() -> Option<PathBuf> {
+        std::env::var("XDG_CONFIG_HOME")
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var("HOME")
+                    .ok()
+                    .map(|h| PathBuf::from(h).join(".config"))
+            })
+            .map(|d| d.join("omaframe"))
+    }
+
+    fn lastdir_file() -> Option<PathBuf> {
+        Self::config_dir().map(|d| d.join("lastdir"))
+    }
+
+    fn read_lastdir() -> Option<PathBuf> {
+        let p = Self::lastdir_file()?;
+        let s = std::fs::read_to_string(p).ok()?;
+        let dir = PathBuf::from(s.trim());
+        dir.is_dir().then_some(dir)
+    }
+
+    fn write_lastdir(dir: &std::path::Path) {
+        if let Some(f) = Self::lastdir_file() {
+            if let Some(parent) = f.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(f, dir.to_string_lossy().as_bytes());
+        }
+    }
+
+    /// Dialog start dir: the bound file's parent, else the last dialog
+    /// directory (persisted), else `~/Documents` when it exists, else `~`
+    /// (else the process cwd).
     fn dialog_start_dir(&self) -> PathBuf {
         if let Some(p) = &self.file_path {
             if let Some(parent) = p.parent() {
                 if !parent.as_os_str().is_empty() {
                     return parent.to_path_buf();
                 }
+            }
+        }
+        if let Some(d) = &self.last_dir {
+            if d.is_dir() {
+                return d.clone();
             }
         }
         if let Ok(home) = std::env::var("HOME") {
@@ -1138,31 +1206,58 @@ impl App {
     }
 
     fn save_dialog_filename(&self) -> String {
-        format!("{}.omaframe.json", self.doc.name)
+        format!("{}.oframe", self.doc.name)
     }
 
-    /// Menu → Load: open the Load dialog over the start dir.
+    /// Menu → Load: open the Load dialog over the start dir. Dirty work is
+    /// saved first when bound (or Save As opens when pathless) so nothing
+    /// is silently discarded.
     pub fn open_load_dialog(&mut self) {
+        if self.dirty {
+            if self.file_path.is_some() {
+                if !self.save() {
+                    return;
+                }
+            } else {
+                self.open_save_as_dialog();
+                self.set_status("save first — then Load");
+                return;
+            }
+        }
         let start = self.dialog_start_dir();
+        self.pending_overwrite = None;
         self.file_dialog = Some(FileDialog::new(
             DialogMode::Open,
             DialogPurpose::Load,
             start,
         ));
-        self.set_status("load: pick a .omaframe.json file");
+        self.set_status("load: pick a .oframe file");
     }
 
     /// Open the SaveNew dialog (fresh bound file at the confirmed path).
+    /// Dirty work is saved first like [`App::open_load_dialog`].
     pub fn open_save_new_dialog(&mut self) {
+        if self.dirty {
+            if self.file_path.is_some() {
+                if !self.save() {
+                    return;
+                }
+            } else {
+                self.open_save_as_dialog();
+                self.set_status("save first — then New");
+                return;
+            }
+        }
         let start = self.dialog_start_dir();
         let mut d = FileDialog::new(DialogMode::Save, DialogPurpose::SaveNew, start);
         d.filename = self.save_dialog_filename();
+        self.pending_overwrite = None;
         self.file_dialog = Some(d);
         self.set_status("new file: pick a folder + name");
     }
 
     /// Open the SaveAs dialog (re-bind the current document on confirm).
-    fn open_save_as_dialog(&mut self) {
+    pub fn open_save_as_dialog(&mut self) {
         let start = self.dialog_start_dir();
         let mut d = FileDialog::new(DialogMode::Save, DialogPurpose::SaveAs, start);
         d.filename = self.save_dialog_filename();
@@ -1173,7 +1268,6 @@ impl App {
     /// Menu → New: keeps the file path slot (save first if dirty), starts a
     /// fresh 80×24 canvas.
     pub fn new_file_to(&mut self, path: PathBuf) -> bool {
-        self.autosave();
         self.doc = Document::new(Self::doc_name_for(&path), 80, 24);
         self.preview_dark = self.doc.preview_dark;
         self.palette_tab = palette_tab_index(&self.doc.palette_tab);
@@ -1248,9 +1342,10 @@ impl App {
     }
 
     /// Confirm the open dialog: Load → [`App::load_file_path`], SaveNew →
-    /// [`App::new_file_to`], SaveAs → [`App::save_as_path`]. Closes the
-    /// dialog + autosaves on success; on failure (or nothing confirmable)
-    /// sets a status and stays open.
+    /// [`App::new_file_to`], SaveAs → [`App::save_as_path`]. SaveNew/SaveAs
+    /// onto an existing file need two consecutive confirms (overwrite
+    /// guard); anything else that changes the target clears the pending
+    /// state. Closes the dialog on success and remembers the directory.
     pub fn dialog_confirm(&mut self) {
         let Some(dlg) = self.file_dialog.as_ref() else {
             return;
@@ -1263,19 +1358,34 @@ impl App {
             });
             return;
         };
+        if matches!(
+            purpose,
+            DialogPurpose::SaveNew | DialogPurpose::SaveAs
+        ) && path.exists()
+            && self.pending_overwrite.as_ref() != Some(&path)
+        {
+            self.pending_overwrite = Some(path);
+            self.set_status("exists — Enter again to overwrite");
+            return;
+        }
+        self.pending_overwrite = None;
         let ok = match purpose {
             DialogPurpose::Load => self.load_file_path(path),
             DialogPurpose::SaveNew => self.new_file_to(path),
             DialogPurpose::SaveAs => self.save_as_path(path),
         };
         if ok {
+            if let Some(dlg) = self.file_dialog.as_ref() {
+                self.last_dir = Some(dlg.cwd.clone());
+                Self::write_lastdir(&dlg.cwd);
+            }
             self.file_dialog = None;
-            self.autosave();
         }
     }
 
     /// Dismiss the open dialog (no action).
     pub fn dialog_cancel(&mut self) {
+        self.pending_overwrite = None;
         self.file_dialog = None;
         self.set_status("cancelled");
     }
@@ -1581,7 +1691,6 @@ impl App {
                 let patch = std::mem::take(&mut self.scratch);
                 if self.history.commit(&mut self.doc, &patch) {
                     self.dirty = true;
-                    self.autosave();
                 }
                 self.anchor = None;
                 self.drawing = false;
@@ -1736,7 +1845,6 @@ impl App {
         let patch = std::mem::take(&mut self.scratch);
         if self.history.commit(&mut self.doc, &patch) {
             self.dirty = true;
-            self.autosave();
             self.set_status("text committed");
         }
     }
@@ -1758,7 +1866,6 @@ impl App {
             }
             if self.history.commit(&mut self.doc, &patch) {
                 self.dirty = true;
-                self.autosave();
                 self.set_status("selection cut");
             }
             self.history.clear_selection();
@@ -1768,7 +1875,6 @@ impl App {
         patch.set(self.cursor.0, self.cursor.1, Cell::erased());
         if self.history.commit(&mut self.doc, &patch) {
             self.dirty = true;
-            self.autosave();
             self.set_status("cleared 1 cell");
         }
     }
@@ -2085,11 +2191,11 @@ mod tests {
     fn dialog_navigation_make_folder_and_confirm_paths() {
         let root = tempdir("dlg");
         std::fs::create_dir_all(root.join("sub").join("nested")).unwrap();
-        std::fs::write(root.join("sub").join("a.omaframe.json"), "{}").unwrap();
-        std::fs::write(root.join("b.omaframe.json"), "{}").unwrap();
+        std::fs::write(root.join("sub").join("a.oframe"), "{}").unwrap();
+        std::fs::write(root.join("b.oframe"), "{}").unwrap();
         std::fs::write(root.join("ignore.txt"), "x").unwrap();
 
-        // Open dialog over the root: dirs first, then *.omaframe.json files.
+        // Open dialog over the root: dirs first, then *.oframe files.
         let mut d = FileDialog::new(DialogMode::Open, DialogPurpose::Load, root.clone());
         assert_eq!(d.cwd, root);
         let names: Vec<(&str, bool)> = d
@@ -2097,7 +2203,7 @@ mod tests {
             .iter()
             .map(|e| (e.name.as_str(), e.is_dir))
             .collect();
-        assert_eq!(names, vec![("sub", true), ("b.omaframe.json", false)]);
+        assert_eq!(names, vec![("sub", true), ("b.oframe", false)]);
         assert!(!d.sidebar.is_empty());
         assert!(d.sidebar.iter().any(|(l, _, _)| l == "Root"));
 
@@ -2111,9 +2217,9 @@ mod tests {
         // Back up, then jump straight into a file's parent via goto.
         d.go_up();
         assert_eq!(d.cwd, root);
-        d.goto(root.join("sub").join("a.omaframe.json"));
+        d.goto(root.join("sub").join("a.oframe"));
         assert_eq!(d.cwd, root.join("sub"));
-        assert_eq!(d.selected, Some(1)); // [nested(dir), a.omaframe.json]
+        assert_eq!(d.selected, Some(1)); // [nested(dir), a.oframe]
         d.goto(root.clone());
 
         // make_folder creates New Folder / New Folder 2… and selects each.
@@ -2139,10 +2245,10 @@ mod tests {
         let file_idx = d
             .entries
             .iter()
-            .position(|e| !e.is_dir && e.name == "b.omaframe.json")
+            .position(|e| !e.is_dir && e.name == "b.oframe")
             .unwrap();
         d.selected = Some(file_idx);
-        assert_eq!(d.confirm_path(), Some(root.join("b.omaframe.json")));
+        assert_eq!(d.confirm_path(), Some(root.join("b.oframe")));
         d.selected = Some(0); // a dir ("New Folder")
         assert!(d.entries[0].is_dir);
         assert_eq!(d.confirm_path(), None);
@@ -2152,13 +2258,13 @@ mod tests {
         // Save confirm: blank filename → None, else cwd/filename.
         let mut s = FileDialog::new(DialogMode::Save, DialogPurpose::SaveAs, root.clone());
         assert_eq!(s.confirm_path(), None);
-        for c in "n.omaframe.json".chars() {
+        for c in "n.oframe".chars() {
             s.type_char(c);
         }
-        assert_eq!(s.filename, "n.omaframe.json");
-        assert_eq!(s.confirm_path(), Some(root.join("n.omaframe.json")));
+        assert_eq!(s.filename, "n.oframe");
+        assert_eq!(s.confirm_path(), Some(root.join("n.oframe")));
         s.backspace();
-        assert_eq!(s.filename, "n.omaframe.jso");
+        assert_eq!(s.filename, "n.ofram");
         s.filename.clear();
         for c in "   ".chars() {
             s.type_char(c);
@@ -2187,22 +2293,26 @@ mod tests {
         );
         app.file_dialog.as_mut().unwrap().goto(root.clone());
         app.file_dialog.as_mut().unwrap().filename.clear();
-        for c in "rt.omaframe.json".chars() {
+        for c in "rt.oframe".chars() {
             app.dialog_type(c);
         }
         app.dialog_confirm();
         assert!(app.file_dialog.is_none(), "dialog closes on success");
-        let path = root.join("rt.omaframe.json");
+        let path = root.join("rt.oframe");
         assert_eq!(app.file_path, Some(path.clone()));
         assert!(path.exists(), "new_file_to saves immediately");
 
-        // Paint + commit (autosaves through the new binding), then load the
-        // file back in a fresh app via the Open dialog + Enter.
+        // Paint + commit marks dirty WITHOUT writing (explicit save
+        // model), then load the file back in a fresh app via dialog.
         app.start_stroke(2, 3, false);
         app.update_stroke(4, 3, false);
         app.end_stroke();
+        assert!(app.dirty, "stroke marks dirty");
         let on_disk = omaframe::model::load_file(&path).unwrap();
-        assert!(on_disk.cell(2, 3).is_some(), "autosaved stroke on disk");
+        assert!(on_disk.cell(2, 3).is_none(), "no autosave: disk unchanged");
+        assert!(app.save(), "explicit save writes");
+        let on_disk = omaframe::model::load_file(&path).unwrap();
+        assert!(on_disk.cell(2, 3).is_some(), "saved stroke on disk");
 
         let mut app2 = App::new(test_doc(), None);
         app2.open_load_dialog();
@@ -2212,7 +2322,7 @@ mod tests {
             let idx = dlg
                 .entries
                 .iter()
-                .position(|e| !e.is_dir && e.name == "rt.omaframe.json")
+                .position(|e| !e.is_dir && e.name == "rt.oframe")
                 .unwrap();
             app2.file_dialog.as_mut().unwrap().selected = Some(idx);
         }
@@ -2240,25 +2350,117 @@ mod tests {
     }
 
     #[test]
-    fn autosave_writes_file_on_stroke_commit() {
+    fn save_appends_oframe_and_strips_suffix_for_doc_names() {
+        use omaframe::model::FILE_EXTENSION;
+        assert_eq!(FILE_EXTENSION, "oframe");
+        // Bare names gain the extension; correct/other extensions pass.
+        let root = tempdir("ext");
+        let mut d = FileDialog::new(
+            DialogMode::Save,
+            DialogPurpose::SaveAs,
+            root.clone(),
+        );
+        d.filename = "foo".to_string();
+        assert_eq!(d.confirm_path(), Some(root.join("foo.oframe")));
+        d.filename = "foo.oframe".to_string();
+        assert_eq!(d.confirm_path(), Some(root.join("foo.oframe")));
+        d.filename = "foo.txt".to_string();
+        assert_eq!(d.confirm_path(), Some(root.join("foo.oframe")));
+        // Doc names strip the full suffix (no double-extension bug).
+        assert_eq!(
+            App::doc_name_for(&root.join("foo.oframe")),
+            "foo"
+        );
+        assert_eq!(
+            App::doc_name_for(&root.join("plain")),
+            "plain"
+        );
+        assert_eq!(
+            App::doc_name_for(&root.join(".oframe")),
+            "untitled"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn overwrite_needs_two_confirms_and_quit_guards_dirty() {
+        let root = tempdir("overwrite");
+        let path = root.join("exists.oframe");
+        std::fs::write(&path, "{}").unwrap();
+        // SaveAs onto an existing file: first confirm warns, dialog stays.
+        let mut app = App::new(test_doc(), None);
+        app.open_save_as_dialog();
+        app.file_dialog.as_mut().unwrap().goto(root.clone());
+        app.file_dialog.as_mut().unwrap().filename.clear();
+        for c in "exists.oframe".chars() {
+            app.dialog_type(c);
+        }
+        app.dialog_confirm();
+        assert!(app.file_dialog.is_some(), "first confirm warns only");
+        assert!(app.status_msg.contains("overwrite"));
+        app.dialog_confirm();
+        assert!(app.file_dialog.is_none(), "second confirm writes");
+        assert_eq!(app.file_path, Some(path.clone()));
+        // Quit guard: clean quits, dirty+path saves+quits, dirty pathless
+        // opens Save instead.
+        let mut clean = App::new(test_doc(), Some(path.clone()));
+        clean.request_quit();
+        assert!(clean.should_quit);
+        let mut dirty = App::new(test_doc(), Some(path.clone()));
+        dirty.start_stroke(1, 1, false);
+        dirty.end_stroke();
+        assert!(dirty.dirty);
+        dirty.request_quit();
+        assert!(dirty.should_quit, "bound dirty saves then quits");
+        assert!(!dirty.dirty);
+        let mut homeless = App::new(test_doc(), None);
+        homeless.start_stroke(1, 1, false);
+        homeless.end_stroke();
+        homeless.request_quit();
+        assert!(!homeless.should_quit, "pathless does not quit");
+        assert!(homeless.file_dialog.is_some(), "Save dialog opens");
+        assert_eq!(
+            homeless.file_dialog.as_ref().unwrap().purpose,
+            DialogPurpose::SaveAs
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn loader_rejects_non_oframe_files() {
+        let root = tempdir("ext-guard");
+        let txt = root.join("notes.txt");
+        std::fs::write(&txt, "{}").unwrap();
+        assert!(omaframe::model::load_file(&txt).is_err());
+        // Loader is case-insensitive on the suffix.
+        let upper = root.join("doc.OFRAME");
+        std::fs::write(&upper, r#"{"version":1,"name":"x","grid":{"w":5,"h":5},"layers":[{"name":"l","visible":true,"cells":[]}]}"#).unwrap();
+        assert!(omaframe::model::load_file(&upper).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn strokes_mark_dirty_without_autosave() {
         let root = tempdir("autosave");
-        let path = root.join("a.omaframe.json");
+        let path = root.join("a.oframe");
         let mut app = App::new(test_doc(), Some(path.clone()));
         assert!(!path.exists());
         app.start_stroke(1, 1, false);
         app.update_stroke(2, 1, false);
         app.end_stroke();
-        assert!(path.exists(), "stroke commit autosaves to the bound path");
+        assert!(app.dirty, "stroke marks dirty");
+        assert!(!path.exists(), "explicit model: no autosave on commit");
+        // Undo/redo also stay in memory only.
+        app.undo();
+        assert!(app.dirty);
+        assert!(!path.exists());
+        app.redo();
+        assert!(!path.exists());
+        // Explicit save writes; quit guard then quits cleanly.
+        assert!(app.save());
         assert!(!app.dirty);
         let doc = omaframe::model::load_file(&path).unwrap();
         assert!(doc.cell(1, 1).is_some());
-        assert!(doc.cell(2, 1).is_some());
-        // Undo/redo also persist.
-        app.undo();
-        let doc = omaframe::model::load_file(&path).unwrap();
-        assert_eq!(doc.cell(1, 1), None);
-        app.redo();
-        let doc = omaframe::model::load_file(&path).unwrap();
         assert!(doc.cell(2, 1).is_some());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2289,7 +2491,7 @@ mod tests {
         // New-file flow binds the path and saves immediately (macOS-style).
         let dir = std::env::temp_dir().join("omaframe-newfile-test");
         let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("n.omaframe.json");
+        let path = dir.join("n.oframe");
         let _ = std::fs::remove_file(&path);
         app.dirty = true;
         assert!(app.new_file_to(path.clone()));
@@ -2309,7 +2511,7 @@ mod tests {
         assert_eq!(app.bg, Some(PaintColor::Ansi(5)));
         // Pan tool shortcut + full path label.
         assert_eq!(Tool::from_shortcut('_'), Some(Tool::Pan));
-        assert!(app.full_path_label().ends_with("n.omaframe.json"));
+        assert!(app.full_path_label().ends_with("n.oframe"));
         // Colors scroll clamps against the caller-provided total.
         // (17 color rows: transparent + 16 slots, headers add more.)
         app.scroll_colors(99, 17, 5);

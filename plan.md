@@ -22,7 +22,7 @@ Design principles:
    from Figma.
 4. **Mouse-first.** Click, drag, handles, scroll. Keyboard is shortcuts +
    command palette (`Ctrl-K`), never modal vim bindings.
-5. **Agent-native.** Every wireframe is a `.omaframe.json` file an agent can
+5. **Agent-native.** Every wireframe is a `.oframe` file an agent can
    read, diff, generate, and modify, plus one-shot text export for pasting
    into a chat window.
 
@@ -109,7 +109,7 @@ omaframe (single Rust binary)
 ├── tools (pencil/box/line/shapes/text/erase/grab/select/widget-stamp)
 ├── palette provider (built-in tabs + user .toml additions)
 ├── theme provider (read colors.toml → Ratatui Style)
-├── file store (~/.local/share/omaframe/ + explicit .omaframe.json paths)
+├── file store (~/.local/share/omaframe/ + explicit .oframe paths)
 ├── exporters (txt, md, clipboard via wl-copy + OSC52 fallback)
 └── cli (headless --export/--import for agents) + SKILL.md
 ```
@@ -117,7 +117,7 @@ omaframe (single Rust binary)
 ### 3.2 Document model
 
 ```jsonc
-// .omaframe.json (v1)
+// .oframe (v1)
 {
   "version": 1,
   "name": "settings-screen",
@@ -262,7 +262,7 @@ Stamp → drag-place → handles to move/resize. Resize reflows borders
 - Tabs: `[ Tab1 | Tab2 ]`
 
 Each widget = parametric entity (`{kind, w, h, label, style}`), not baked
-chars, so resize/relabel works. Serialized in `.omaframe.json` as
+chars, so resize/relabel works. Serialized in `.oframe` as
 `widgets[]` + baked cells fallback for export.
 
 ### 4.5 Layers UX
@@ -296,8 +296,8 @@ front door — no vim modes required.
 
 ## 5. Files, export, clipboard
 
-- Save: explicit `.omaframe.json` anywhere + autosave to
-  `~/.local/share/omaframe/autosave/`. Dirty dot, `Ctrl-S` save.
+- Save: explicit `.oframe` anywhere (Ctrl-S / menu Save / Save As).
+  Dirty dot, no autosave — writes happen only on explicit save.
 - Export full or selection:
   - `.txt` — plain characters, trailing-space trimmed, ANSI stripped.
   - `.md` — fenced block (` ```text `) + optional title; for docs.
@@ -306,14 +306,14 @@ front door — no vim modes required.
   `Copy` button + `Ctrl-K → Copy selection as text` — the paste-into-agent
   flow.
 - CLI (headless, for scripts/agents):
-  `omaframe --open file.omaframe.json --export txt --to out.txt [--selection x,y,w,h]`
+  `omaframe --open file.oframe --export txt --to out.txt [--selection x,y,w,h]`
   and `--export md`. Exit codes + stderr on bad geometry.
 
 ## 6. Agent skill
 
 Ship `skills/omaframe/SKILL.md` + `schema.json`:
 
-- What a `.omaframe.json` means (grid, layers, fg/bg indices, transparency).
+- What a `.oframe` means (grid, layers, fg/bg indices, transparency).
 - How to render it to text (top-wins compose, trim, width rules).
 - How to modify it (move widget = update cells/widgets[], recolor = change
   fg indices, add label = append text-layer cells).
@@ -353,7 +353,7 @@ The skill reads/writes the same schema as the app — no parallel format.
 - **Phase 4 — Layers + glyphs**: multi-layer compose + transparency, Nerds tab
   (~100) + font test page + missing-glyph banner. Acceptance: bg wireframe +
   text overlay composes; test page renders.
-- **Phase 5 — Files + skill**: save/autosave, txt/md/clipboard (full +
+- **Phase 5 — Files + skill**: explicit save, txt/md/clipboard (full +
   selection), CLI export, `SKILL.md` + schema. Acceptance: file→export→paste-
   to-agent round-trip + agent JSON patch test.
 - **Phase 6 — Command palette + polish**: `Ctrl-K`, templates
@@ -365,7 +365,7 @@ The skill reads/writes the same schema as the app — no parallel format.
 
 - Unit (Rust): compose/top-wins, transparency, ellipse rasterization, junction
   attach, wide-char cursor math, JSON round-trip.
-- Snapshot: `testdata/*.omaframe.json → expected/*.txt` golden files
+- Snapshot: `testdata/*.oframe → expected/*.txt` golden files
   (replaces Playwright e2e; terminal app has no DOM).
 - Manual checklist per phase: mouse drag, shift-snap, handle resize, theme
   switch, Nerd-missing fallback, SSH/OSC52 clipboard.
@@ -400,7 +400,7 @@ The skill reads/writes the same schema as the app — no parallel format.
 - Blocks: `█ ▓ ▒ ░ ▀ ▄ ▌ ▐ ▖ ▗ ▘ ▝ ▚ ▞ ▟`
 - Nerds: see `assets/nerd.txt` (to be seeded in Phase 0).
 
-## Appendix C. Example `.omaframe.json` (tiny)
+## Appendix C. Example `.oframe` (tiny)
 
 ```json
 {

@@ -23,7 +23,7 @@ canvas, no fake zoom, no proportional fonts on the canvas.
   pencil, eyedropper, big scrolling palette.
 - **Mouse-first.** Click, drag, handles, scroll. Keyboard is shortcuts plus
   a command palette (`Ctrl-K`) — never modal vim bindings.
-- **Agent-native.** Every wireframe is a `.omaframe.json` file an agent can
+- **Agent-native.** Every wireframe is a `.oframe` file an agent can
   read, diff, generate, and modify, plus one-shot text export for pasting
   into a chat window.
 

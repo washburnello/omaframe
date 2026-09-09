@@ -28,14 +28,22 @@ use app::{App, DialogMode, Tool};
 use ui::LayoutAreas;
 
 fn doc_name_for(path: &std::path::Path) -> String {
-    path.file_stem()
+    let file_name = path
+        .file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or("untitled")
-        .to_string()
+        .unwrap_or("");
+    let stripped = file_name
+        .strip_suffix(".oframe")
+        .unwrap_or(file_name);
+    if stripped.is_empty() {
+        "untitled".to_string()
+    } else {
+        stripped.to_string()
+    }
 }
 
 fn open_or_create(path: Option<PathBuf>) -> (Document, Option<PathBuf>) {
-    // Tilde-expand CLI paths (`omaframe ~/x.omaframe.json` just works).
+    // Tilde-expand CLI paths (`omaframe ~/x.oframe` just works).
     let path = path.map(|p| App::expand_path(&p.to_string_lossy()));
     match path {
         Some(p) => {
@@ -121,8 +129,7 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
         if ctrl {
             match code {
                 KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Char('c') | KeyCode::Char('C') => {
-                    app.autosave();
-                    app.should_quit = true;
+                    app.dialog_cancel();
                 }
                 // Leave Ctrl-S on its normal save path (never confirms).
                 KeyCode::Char('s') | KeyCode::Char('S') => {
@@ -182,8 +189,7 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
                 return true;
             }
             KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Char('c') | KeyCode::Char('C') => {
-                app.autosave();
-                app.should_quit = true;
+                app.request_quit();
                 return true;
             }
             KeyCode::Char('p') | KeyCode::Char('P') => {
@@ -478,6 +484,7 @@ fn handle_mouse(
                 match action {
                     ui::MenuAction::New => app.open_save_new_dialog(),
                     ui::MenuAction::Save => app.menu_save(),
+                    ui::MenuAction::SaveAs => app.open_save_as_dialog(),
                     ui::MenuAction::Load => app.open_load_dialog(),
                 }
                 return;
@@ -735,7 +742,6 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    app.autosave();
     restore_terminal();
     Ok(())
 }

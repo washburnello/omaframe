@@ -1,17 +1,17 @@
 ---
 name: omaframe
-description: Read, render, and patch omaframe TUI wireframe files (.omaframe.json): schema, text export via layer compose, edits (move/recolor/label), and guardrails. Use when viewing or modifying wireframes in this repo.
+description: Read, render, and patch omaframe TUI wireframe files (.oframe): schema, text export via layer compose, edits (move/recolor/label), and guardrails. Use when viewing or modifying wireframes in this repo.
 ---
 
 # omaframe skill
 
-An `.omaframe.json` file is a complete TUI wireframe: a fixed grid of
+An `.oframe` file is a complete TUI wireframe: a fixed grid of
 character cells plus stacked layers. Read it, render it to text, or patch it
 with small scripts. The app (`omaframe`) reads and writes this same schema —
 there is no parallel format.
 
 Reference schema: `skills/omaframe/schema.json` (JSON Schema, draft 2020-12).
-Example wireframe + golden text export: `testdata/demo.omaframe.json`,
+Example wireframe + golden text export: `testdata/demo.oframe`,
 `testdata/demo.txt`.
 
 ## 1. Schema explanation
@@ -58,7 +58,7 @@ Transparency and compose ("top-wins"):
   layer with a non-transparent cell wins** at each position.
 - Typical pattern: the `Frames` layer draws full borders/widget frames and
   the `Text` layer overwrites spans of them with text (e.g. a title sitting
-  on the top border). That is how `testdata/demo.omaframe.json` works: the
+  on the top border). That is how `testdata/demo.oframe` works: the
   `Settings` title cells live in `Text` and cover the `─` cells beneath them.
 
 ## 2. How to render to text
@@ -142,7 +142,7 @@ Read (shape of the file — grid, layers, widgets):
 
 ```python
 import json
-doc = json.load(open("testdata/demo.omaframe.json"))
+doc = json.load(open("testdata/demo.oframe"))
 print(doc["grid"], [l["name"] for l in doc["layers"]], len(doc["widgets"]))
 ```
 
@@ -152,7 +152,7 @@ layer, letters in the text layer — `wireframe`/`labels` in this demo file,
 
 ```python
 import json
-p = "testdata/demo.omaframe.json"
+p = "testdata/demo.oframe"
 doc = json.load(open(p))
 ok = {"x0": 5, "x1": 10, "y": 2}          # button span in baked cells
 for layer in doc["layers"]:               # shift baked cells in both layers
@@ -167,7 +167,7 @@ Export round-trip (compose per section 2, diff against the golden snapshot):
 
 ```python
 import json
-doc = json.load(open("testdata/demo.omaframe.json"))
+doc = json.load(open("testdata/demo.oframe"))
 w, h = doc["grid"]["w"], doc["grid"]["h"]
 grid = [[" "] * w for _ in range(h)]
 for layer in doc["layers"]:
