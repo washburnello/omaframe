@@ -104,6 +104,15 @@ fn dialog_selected_is_file(app: &App) -> bool {
     })
 }
 
+/// True when the dialog highlight sits on a directory.
+fn dialog_selected_is_dir(app: &App) -> bool {
+    app.file_dialog.as_ref().is_some_and(|d| {
+        d.selected
+            .and_then(|i| d.entries.get(i))
+            .is_some_and(|e| e.is_dir)
+    })
+}
+
 /// Swatch color for a [`theme::ColorRow::Entry`] address (None when the
 /// address is stale — rows and groups are built from the same theme, so
 /// this only fires across a theme reload mid-click).
@@ -144,12 +153,13 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
         match code {
             KeyCode::Esc => app.dialog_cancel(),
             KeyCode::Enter => {
-                // Open picker with a file highlighted confirms at once;
-                // anything else descends / commits the filename box.
-                if dialog_is_open_mode(app) && dialog_selected_is_file(app) {
-                    app.dialog_confirm();
-                } else {
+                // Files confirm (Open pickers load, Save pickers create);
+                // Save pickers also confirm on an empty highlight (the
+                // filename box is the target). Highlighted folders descend.
+                if dialog_selected_is_dir(app) {
                     app.dialog_enter();
+                } else {
+                    app.dialog_confirm();
                 }
             }
             KeyCode::Up => app.dialog_move_selection(-1),
@@ -457,13 +467,23 @@ fn handle_mouse(
                     let already =
                         app.file_dialog.as_ref().and_then(|d| d.selected) == Some(idx);
                     if already {
-                        // Re-click: files confirm in Open pickers, folders
-                        // descend; a file in a save picker just keeps its
-                        // selection (the Save button confirms).
+                        // Re-click: files confirm (double-click convention).
+                        // Save pickers adopt the clicked name first since
+                        // confirm reads the filename box; the overwrite
+                        // guard still applies. Folders descend.
                         if dialog_selected_is_file(app) {
-                            if dialog_is_open_mode(app) {
-                                app.dialog_confirm();
+                            if !dialog_is_open_mode(app) {
+                                if let Some(d) = app.file_dialog.as_mut() {
+                                    if let Some(name) = d
+                                        .selected
+                                        .and_then(|s| d.entries.get(s))
+                                        .map(|e| e.name.clone())
+                                    {
+                                        d.filename = name;
+                                    }
+                                }
                             }
+                            app.dialog_confirm();
                         } else {
                             app.dialog_enter();
                         }
@@ -752,5 +772,61 @@ fn main() {
         restore_terminal();
         eprintln!("omaframe: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn isolated_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "omaframe-enter-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// Regression: Enter in a Save dialog must confirm (create the file).
+    /// Previously Enter only descended into highlighted folders, so
+    /// keyboard users could never create a file.
+    #[test]
+    fn enter_in_save_dialog_confirms_new_file() {
+        let root = isolated_root("save");
+        let mut app = App::new(Document::new("t", 80, 24), None);
+        app.open_save_new_dialog();
+        app.file_dialog.as_mut().unwrap().goto(root.clone());
+        // Prefilled default name — no retyping, no clicks.
+        assert!(app.file_dialog.as_ref().unwrap().confirm_path().is_some());
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::empty());
+        assert!(app.file_dialog.is_none(), "Enter confirms SaveNew");
+        let path = app.file_path.clone().expect("bound");
+        assert!(path.exists(), "file created");
+        assert_eq!(
+            path.file_name().and_then(|s| s.to_str()),
+            Some("t.oframe")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Enter on a highlighted folder still descends instead of confirming.
+    #[test]
+    fn enter_on_highlighted_folder_descends() {
+        let root = isolated_root("descend");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let mut app = App::new(Document::new("t", 80, 24), None);
+        app.open_save_new_dialog();
+        app.file_dialog.as_mut().unwrap().goto(root.clone());
+        app.dialog_move_selection(1); // first row: the subdir
+        assert!(dialog_selected_is_dir(&app));
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::empty());
+        assert!(app.file_dialog.is_some(), "dialog stays open");
+        assert_eq!(
+            app.file_dialog.as_ref().unwrap().cwd,
+            root.join("sub")
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
