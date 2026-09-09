@@ -460,6 +460,19 @@ fn handle_mouse(
                 }
                 return;
             }
+            if let Some(hit) = ui::hit_colors_bar(areas, app, col, row) {
+                let total = ui::colors_total_rows();
+                let visible = areas.colors.height as usize;
+                match hit {
+                    ui::ColorBarHit::Up => app.scroll_colors(-1, total, visible),
+                    ui::ColorBarHit::Down => app.scroll_colors(1, total, visible),
+                    ui::ColorBarHit::Jump(tr) => {
+                        app.colors_scroll =
+                            ui::colors_bar_target(total, visible, tr);
+                    }
+                }
+                return;
+            }
             if let Some(row_idx) = ui::hit_colors(areas, app, col, row) {
                 match theme::color_rows(theme).get(row_idx) {
                     Some(theme::ColorRow::Header(name)) => {
@@ -641,8 +654,10 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
     let (doc, file_path) = open_or_create(arg_path);
     let mut app = App::new(doc, file_path);
     // Main owns the theme instance for the whole loop: canvas styles and
-    // the Colors-panel rows/groups all resolve against it.
-    let theme = theme::load();
+    // the Colors-panel rows/groups all resolve against it. The watcher
+    // reloads it live when the Omarchy theme changes mid-session.
+    let mut theme = theme::load();
+    let mut watch = theme::ThemeWatch::new();
 
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -662,21 +677,31 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         if app.should_quit {
             break;
         }
-        let ev = event::read()?;
-        match ev {
-            Event::Key(k) => {
-                handle_key(&mut app, k.code, k.modifiers);
+        // Poll (don't block forever) so the theme watcher gets a timeslice
+        // even with no input. 250ms is imperceptible and ~free.
+        if event::poll(std::time::Duration::from_millis(250))? {
+            let ev = event::read()?;
+            match ev {
+                Event::Key(k) => {
+                    handle_key(&mut app, k.code, k.modifiers);
+                }
+                Event::Mouse(m) => {
+                    let term = term_area(tw, th);
+                    let areas = ui::compute_layout(term, app.doc.layers.len());
+                    handle_mouse(&mut app, &areas, term, &theme, m.kind, m.column, m.row, m.modifiers);
+                }
+                Event::Resize(w, h) => {
+                    tw = w;
+                    th = h;
+                }
+                _ => {}
             }
-            Event::Mouse(m) => {
-                let term = term_area(tw, th);
-                let areas = ui::compute_layout(term, app.doc.layers.len());
-                handle_mouse(&mut app, &areas, term, &theme, m.kind, m.column, m.row, m.modifiers);
-            }
-            Event::Resize(w, h) => {
-                tw = w;
-                th = h;
-            }
-            _ => {}
+        }
+        // Live theme reload: re-tints chrome, ANSI slots, and panel
+        // swatches. Frozen RGB cells are untouched by design.
+        if let Some(path) = watch.check() {
+            theme = theme::load();
+            app.set_status(format!("theme: {}", theme::theme_name(&path)));
         }
     }
 

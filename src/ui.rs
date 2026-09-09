@@ -9,7 +9,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Clear, Paragraph},
 };
 
 use crate::app::{
@@ -25,7 +25,7 @@ use omaframe::theme::ColorRow;
 
 pub const MIN_W: u16 = 60;
 pub const MIN_H: u16 = 16;
-const LEFT_W: u16 = 14;
+const LEFT_W: u16 = 15;
 const PALETTE_W: u16 = 26;
 const TOOLS_N: u16 = 11;
 const MENU_H: u16 = 3;
@@ -38,9 +38,13 @@ pub enum MenuAction {
     Load,
 }
 
-/// Screen rects. `tools`, `colors`, `canvas`, `palette_*`, `layers` are
-/// inner interaction rects (inside their panel borders); render functions
-/// draw the surrounding box in the rows/cols around them.
+/// 1-cell breathing gaps between the panel columns (wireframe clarity).
+const GAP_W: u16 = 1;
+
+/// Screen rects. `tools`, `colors`, `canvas`, `palette_*`, `layer_rows`
+/// are inner interaction rects (inside their panel borders); render
+/// functions draw the surrounding box in the rows/cols around them.
+/// Gaps belong to no panel: clicks there do nothing.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LayoutAreas {
     pub menu_top: Rect,
@@ -53,7 +57,6 @@ pub struct LayoutAreas {
     pub palette_tabs: Rect,
     pub palette_grid: Rect,
     pub layer_rows: Rect,
-    pub status: Rect,
     pub too_small: bool,
 }
 
@@ -77,21 +80,21 @@ pub fn compute_layout(area: Rect, n_layers: usize) -> LayoutAreas {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(TOOLS_N + 3), // main (tools box needs 13+ rows)
-            Constraint::Length(1),        // status bar
         ])
         .split(area);
-    let status = v[1];
     let h = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Length(LEFT_W),
+            Constraint::Length(GAP_W), // breathing room, tools ↔ canvas
             Constraint::Min(10),
+            Constraint::Length(GAP_W), // breathing room, canvas ↔ palette
             Constraint::Length(PALETTE_W),
         ])
         .split(v[0]);
     let left_outer = h[0];
-    let center_outer = h[1];
-    let palette_outer = h[2];
+    let center_outer = h[2];
+    let palette_outer = h[4];
 
     // Left column: tools box (fixed) + colors box (rest).
     let tools_outer = Rect::new(
@@ -172,7 +175,6 @@ pub fn compute_layout(area: Rect, n_layers: usize) -> LayoutAreas {
         palette_tabs,
         palette_grid,
         layer_rows,
-        status,
         too_small: false,
     }
 }
@@ -364,6 +366,73 @@ pub fn colors_total_rows() -> usize {
     theme::color_rows(&theme::defaults()).len()
 }
 
+/// Scrollbar geometry for the Colors panel: `(thumb_start, thumb_len)` in
+/// track coordinates (the track is the inner height minus the ▲▼ rows).
+/// `None` when everything fits (no bar) or there is no room for one.
+/// Pure math, unit-tested below.
+pub fn scrollbar_geom(total: usize, scroll: usize, visible: usize) -> Option<(usize, usize)> {
+    if total <= visible || visible < 3 {
+        return None;
+    }
+    let track = visible - 2;
+    let max_scroll = total - visible;
+    let start = scroll.min(max_scroll);
+    let thumb_len = ((visible * track) / total).max(1).min(track);
+    let thumb_start = if max_scroll == 0 || track <= thumb_len {
+        0
+    } else {
+        start * (track - thumb_len) / max_scroll
+    };
+    Some((thumb_start, thumb_len))
+}
+
+/// Colors-panel scrollbar clicks: arrows step, track jumps. `Jump` carries
+/// the 0-based track row (below the ▲).
+pub enum ColorBarHit {
+    Up,
+    Down,
+    Jump(usize),
+}
+
+pub fn hit_colors_bar(
+    areas: &LayoutAreas,
+    app: &App,
+    col: u16,
+    row: u16,
+) -> Option<ColorBarHit> {
+    let gh = areas.colors.height as usize;
+    let geom = scrollbar_geom(colors_total_rows(), app.colors_scroll, gh)?;
+    if !contains(areas.colors, col, row) {
+        return None;
+    }
+    if col != areas.colors.x + areas.colors.width - 1 {
+        return None;
+    }
+    let r = (row - areas.colors.y) as usize;
+    if r == 0 {
+        return Some(ColorBarHit::Up);
+    }
+    if r + 1 == gh {
+        return Some(ColorBarHit::Down);
+    }
+    let (tstart, tlen) = geom;
+    let tr = r - 1;
+    if tr >= tstart && tr < tstart + tlen {
+        return None; // on the thumb: nothing to jump to (no drag support)
+    }
+    Some(ColorBarHit::Jump(tr))
+}
+
+/// Target scroll for a track click: proportional position, ends exact.
+pub fn colors_bar_target(total: usize, visible: usize, track_row: usize) -> usize {
+    let max = total.saturating_sub(visible.max(1));
+    let track = visible.saturating_sub(2);
+    if track <= 1 {
+        return if track_row == 0 { 0 } else { max };
+    }
+    (track_row * max / (track - 1)).min(max)
+}
+
 /// Map a click in the Colors panel to a ROW index into `theme::color_rows`
 /// (scroll-adjusted via `app.colors_scroll`, clamped to the row count).
 /// `main.rs` maps the row via `color_rows`: `Header` rows are not clickable
@@ -375,6 +444,13 @@ pub fn hit_colors(
     row: u16,
 ) -> Option<usize> {
     if !contains(areas.colors, col, row) {
+        return None;
+    }
+    // The scrollbar owns the last column when visible (see hit_colors_bar).
+    let gh = areas.colors.height as usize;
+    if scrollbar_geom(colors_total_rows(), app.colors_scroll, gh).is_some()
+        && col >= areas.colors.x + areas.colors.width - 1
+    {
         return None;
     }
     let idx = app.colors_scroll + (row - areas.colors.y) as usize;
@@ -566,11 +642,42 @@ fn bottom_border(w: usize) -> String {
 }
 
 /// Canvas bottom border carrying the content size:
-/// `└─┘Size:{WxH}└──…──┘` (`"empty"` when there is no content), exactly
-/// `w + 2` cells wide like [`bottom_border`].
-fn canvas_bottom(w: usize, size: &str) -> String {
-    let label = truncate_to(&format!("Size:{size}"), w.saturating_sub(4));
-    let mut s = format!("└─┘{label}└");
+/// Canvas top border: viewport origin left, cursor cell right —
+/// `┌─┐{ox},{oy}┌──…──{cx},{cy}┌─┐`, exactly `w + 2` cells wide. The
+/// right-hand readout replaces the old status-bar cursor line.
+fn canvas_top(w: usize, ox: i32, oy: i32, cx: i32, cy: i32) -> String {
+    let left = format!("┌─┐{ox},{oy}┌");
+    let right = format!("{cx},{cy}┌─┐");
+    let ln = left.chars().count();
+    let rn = right.chars().count();
+    if ln + rn + 1 > w + 2 {
+        return truncate_to(&format!("{left}{right}"), w + 2);
+    }
+    let mut s = left;
+    while s.chars().count() < w + 2 - rn {
+        s.push('─');
+    }
+    s + &right
+}
+
+/// `└─┘Size:{WxH} · {message}└──…──┘` (`"empty"` when there is no content),
+/// exactly `w + 2` cells wide like [`bottom_border`]. The trailing message
+/// replaces the old status bar: transient feedback lives here now.
+fn canvas_bottom(w: usize, size: &str, msg: &str) -> String {
+    let mut head = format!("└─┘Size:{size}");
+    let m = msg.trim();
+    if !m.is_empty() {
+        head = format!("{head} · {m}");
+    }
+    // Break at a word boundary so the message never ends mid-word.
+    let max = w.saturating_sub(1);
+    let mut head = truncate_to(&head, max);
+    if head.chars().count() >= max && !head.ends_with([' ', '·']) {
+        if let Some(i) = head.rfind(' ') {
+            head.truncate(i);
+        }
+    }
+    let mut s = head;
     while s.chars().count() < w + 1 {
         s.push('─');
     }
@@ -679,6 +786,40 @@ fn truncate_to(s: &str, w: usize) -> String {
     out
 }
 
+/// Tool icon column: the pencil gets its nerd glyph (U+F040, verified in
+/// `assets/nerd.txt`); every other tool gets a blank cell so labels align.
+fn tool_icon(tool: Tool) -> &'static str {
+    match tool {
+        Tool::Pencil => "\u{F040}",
+        _ => " ",
+    }
+}
+
+/// Hotkey letter to highlight inside the label (btop discipline: the
+/// highlighted letter IS the key). `None` when the shortcut appears nowhere
+/// in the label — those rows get a dim `(key)` suffix instead.
+fn tool_hotkey(tool: Tool) -> Option<char> {
+    let s = tool.shortcut();
+    if tool.label().chars().any(|c| c.eq_ignore_ascii_case(&s)) {
+        return Some(s);
+    }
+    // 's' also selects (see `Tool::from_shortcut`).
+    if tool == Tool::Select {
+        return Some('s');
+    }
+    None
+}
+
+/// Suffix for tools without an in-label hotkey: the literal key.
+fn tool_key_suffix(tool: Tool) -> &'static str {
+    match tool {
+        // Space is the discoverable Pan key ('_' works too).
+        Tool::Pan => " (space)",
+        Tool::Rect => " (d)",
+        _ => "",
+    }
+}
+
 fn render_tools(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme) {
     let outer = outer_of(areas.tools);
     let w = areas.tools.width as usize;
@@ -694,16 +835,44 @@ fn render_tools(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme)
     let mut lines: Vec<Line> = Vec::new();
     for tool in Tool::ALL {
         let active = tool == app.tool;
-        let marker = if active { "►" } else { " " };
-        let style = if active {
+        let base = if active {
             Style::default().bg(t.accent).fg(t.bg).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(t.fg)
         };
-        lines.push(Line::from(vec![Span::styled(
-            format!("{}{} {}", marker, tool.shortcut(), tool.label()),
-            style,
-        )]));
+        // Hotkey letter contrasts against the row background either way.
+        let hot = if active {
+            Style::default()
+                .bg(t.accent)
+                .fg(t.bg)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default()
+                .fg(t.accent)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        };
+        let mut spans = vec![Span::styled(tool_icon(tool), base), Span::styled(" ", base)];
+        let label = tool.label();
+        match tool_hotkey(tool) {
+            Some(h) => {
+                let pos = label
+                    .chars()
+                    .position(|c| c.eq_ignore_ascii_case(&h))
+                    .unwrap_or(0);
+                let pre: String = label.chars().take(pos).collect();
+                let hot_c: String = label.chars().skip(pos).take(1).collect();
+                let post: String = label.chars().skip(pos + 1).collect();
+                // Capitalize the hotkey like btop (`Pencil`, `Box`, …).
+                spans.push(Span::styled(pre, base));
+                spans.push(Span::styled(hot_c.to_uppercase(), hot));
+                spans.push(Span::styled(post, base));
+            }
+            None => {
+                spans.push(Span::styled(label.to_string(), base));
+                spans.push(Span::styled(tool_key_suffix(tool), Style::default().fg(t.dim)));
+            }
+        }
+        lines.push(Line::from(spans));
     }
     // Box-state line under the 11 tools when space allows.
     f.render_widget(Paragraph::new(lines), areas.tools);
@@ -733,16 +902,21 @@ fn render_canvas(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme
     if cw <= 0 || ch <= 0 {
         return;
     }
-    // Boxed canvas with the viewport origin in the top border (infinite
-    // canvas: the origin drifts as you scroll).
+    // Boxed canvas: viewport origin left, cursor cell right (the old
+    // status-bar cursor line now lives in the border).
     let outer = outer_of(areas.canvas);
     let w = areas.canvas.width as usize;
-    let origin = format!("{},{}", app.viewport.0, app.viewport.1);
     render_top_row(
         f,
         outer,
         Line::from(Span::styled(
-            top_titled(w, &origin),
+            canvas_top(
+                w,
+                app.viewport.0,
+                app.viewport.1,
+                app.cursor.0,
+                app.cursor.1,
+            ),
             Style::default().fg(t.dim),
         )),
         t,
@@ -792,13 +966,15 @@ fn render_canvas(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme
     }
     f.render_widget(Paragraph::new(lines), areas.canvas);
     panel_sides(f, outer, t);
-    // Bottom border carries the content size (`Size:WxH`, `"empty"`).
+    // Bottom border carries the content size plus the latest status message
+    // (the old status bar lives here now).
     let size = match model::content_bounds(&app.doc) {
         Some(b) => format!("{}x{}", b.w, b.h),
         None => "empty".to_string(),
     };
     f.render_widget(
-        Paragraph::new(canvas_bottom(w, &size)).style(Style::default().fg(t.dim)),
+        Paragraph::new(canvas_bottom(w, &size, &app.status_msg))
+            .style(Style::default().fg(t.dim)),
         Rect::new(outer.x, outer.y + outer.height - 1, outer.width, 1),
     );
 }
@@ -934,6 +1110,14 @@ fn render_colors(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme
     let rows = theme::color_rows(t);
     let groups = theme::color_groups(t);
     let gh = areas.colors.height as usize;
+    // Content width reserves the scrollbar column when visible.
+    let bar_here =
+        scrollbar_geom(rows.len(), app.colors_scroll, gh).is_some();
+    let cw = if bar_here {
+        w.saturating_sub(1)
+    } else {
+        w
+    };
     let mut lines: Vec<Line> = Vec::new();
     for r in 0..gh {
         let idx = app.colors_scroll + r;
@@ -944,12 +1128,12 @@ fn render_colors(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme
         match row {
             ColorRow::Header(name) => {
                 lines.push(Line::from(vec![Span::styled(
-                    truncate_to(&format!("-{name}-"), w),
+                    truncate_to(&format!("-{name}-"), cw),
                     Style::default().fg(t.dim),
                 )]));
             }
             ColorRow::Transparent => {
-                let mark = if app.bg.is_none() { "*" } else { " " };
+                let mark = if app.bg.is_none() { "●" } else { " " };
                 lines.push(Line::from(vec![
                     Span::styled(mark.to_string(), Style::default().fg(t.fg)),
                     Span::styled(" -none- ", Style::default().fg(t.dim)),
@@ -961,10 +1145,11 @@ fn render_colors(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme
                     .and_then(|g| g.entries.get(*index))
                     .map(|e| e.color)
                     .unwrap_or(PaintColor::Ansi(7));
+                // Pot markers: ▶ fg, ● bg, ◉ both (radio-bullet family).
                 let mark = match (app.fg == color, app.bg == Some(color)) {
-                    (true, true) => "#",
-                    (true, false) => ">",
-                    (false, true) => "*",
+                    (true, true) => "◉",
+                    (true, false) => "▶",
+                    (false, true) => "●",
                     (false, false) => " ",
                 };
                 lines.push(Line::from(vec![
@@ -979,13 +1164,42 @@ fn render_colors(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme
             }
         }
     }
+    // Colors scrollbar (last column): ▲▼ ends + ░ track with █ thumb so
+    // the scroll position is always visible.
+    if let Some((tstart, tlen)) = scrollbar_geom(rows.len(), app.colors_scroll, gh) {
+        let arrow = Style::default()
+            .fg(t.accent)
+            .add_modifier(Modifier::BOLD);
+        for (r, line) in lines.iter_mut().enumerate() {
+            let cell = if r == 0 {
+                "▲"
+            } else if r + 1 == gh {
+                "▼"
+            } else {
+                let tr = r - 1;
+                if tr >= tstart && tr < tstart + tlen {
+                    "█"
+                } else {
+                    "░"
+                }
+            };
+            let style = if cell == "░" {
+                Style::default().fg(t.dim)
+            } else if cell == "█" {
+                Style::default().fg(t.fg)
+            } else {
+                arrow
+            };
+            line.spans.push(Span::styled(cell, style));
+        }
+    }
     f.render_widget(Paragraph::new(lines), areas.colors);
     panel_sides(f, outer, t);
     render_bottom_row(f, outer, w, t);
 }
 
 /// Layers panel (bottom-right box, wireframe `┌─┐Layers┌──┐`): one row per
-/// layer, topmost first — `{eye}{active} {name}`.
+/// layer, topmost first — `▶` active, `●` visible / `○` hidden.
 fn render_layers_panel(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme) {
     let outer = outer_of(areas.layer_rows);
     let w = areas.layer_rows.width as usize;
@@ -1010,15 +1224,17 @@ fn render_layers_panel(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme:
         }
         let idx = n - 1 - r;
         let nl = &app.doc.layers[idx];
-        let eye = if nl.visible { "▣" } else { "▢" };
         let active = idx == app.doc.active;
+        // Bullet-family markers: ▶ active layer, ●/○ visibility.
+        let mark = if active { "▶" } else { " " };
+        let eye = if nl.visible { "●" } else { "○" };
         let style = if active {
             Style::default().bg(t.accent).fg(t.bg).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(t.fg)
         };
         lines.push(Line::from(vec![Span::styled(
-            truncate_to(&format!("{}{} {}", eye, if active { "*" } else { " " }, nl.name), w),
+            truncate_to(&format!("{mark}{eye} {}", nl.name), w),
             style,
         )]));
     }
@@ -1027,42 +1243,13 @@ fn render_layers_panel(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme:
     render_bottom_row(f, outer, w, t);
 }
 
-fn render_status(f: &mut Frame, areas: &LayoutAreas, app: &App, t: &theme::Theme) {
-    // Plain status line (the inline path prompt is gone; file I/O goes
-    // through the modal dialog rendered on top).
-    let size = match model::content_bounds(&app.doc) {
-        Some(b) => format!("{}x{}", b.w, b.h),
-        None => "empty".to_string(),
-    };
-    let sel = match app.history.selection() {
-        Some(r) => format!(" sel {}x{}@{},{}", r.w, r.h, r.x, r.y),
-        None => String::new(),
-    };
-    let msg = format!(
-        "cell {},{} · {} · fg {} bg {} · {} · {}{} · [{}] {} · {}",
-        app.cursor.0,
-        app.cursor.1,
-        app.active_layer_name(),
-        app.fg_label(),
-        app.bg_label(),
-        app.file_label(),
-        size,
-        sel,
-        app.tool.label(),
-        app.ch,
-        app.status_msg,
-    );
-    let msg = truncate_to(&msg, areas.status.width as usize);
-    f.render_widget(
-        Paragraph::new(msg).style(Style::default().bg(t.bg).fg(t.fg)),
-        areas.status,
-    );
-}
-
 /// Top-level render. Never panics on small terminals: below the minimum it
 /// shows a one-line guard message instead of the full layout.
 pub fn render(f: &mut Frame, app: &mut App, t: &theme::Theme) {
     let area = f.area();
+    // Clear first: panel gaps belong to no widget and must not smear on
+    // resize.
+    f.render_widget(Clear, area);
     let areas = compute_layout(area, app.doc.layers.len());
     if areas.too_small {
         let msg = format!(
@@ -1078,7 +1265,6 @@ pub fn render(f: &mut Frame, app: &mut App, t: &theme::Theme) {
     render_canvas(f, &areas, app, t);
     render_palette(f, &areas, app, t);
     render_layers_panel(f, &areas, app, t);
-    render_status(f, &areas, app, t);
     // Modal file dialog on top (nothing when closed or too small).
     if app.file_dialog.is_some() {
         render_dialog(f, area, app, t);
@@ -1337,7 +1523,16 @@ mod tests {
     }
 
     fn render_to_buf(app: &mut App, t: &theme::Theme) -> ratatui::buffer::Buffer {
-        let backend = TestBackend::new(80, 24);
+        render_to_buf_sized(app, t, 80, 24)
+    }
+
+    fn render_to_buf_sized(
+        app: &mut App,
+        t: &theme::Theme,
+        w: u16,
+        h: u16,
+    ) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(w, h);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| render(f, app, t)).unwrap();
         term.backend().buffer().clone()
@@ -1395,11 +1590,11 @@ mod tests {
 
     #[test]
     fn palette_scroll_arrows_render_and_hit() {
-        // Glyphs tab overflows the grid: ▼ on the last row, nothing on top.
+        // Glyphs tab overflows a short grid: ▼ on the last row, nothing up.
         let (mut app, t) = harness();
         app.set_palette_tab(5);
-        let buf = render_to_buf(&mut app, &t);
-        let areas = compute_layout(ratatui::layout::Rect::new(0, 0, 80, 24), 3);
+        let buf = render_to_buf_sized(&mut app, &t, 80, 20);
+        let areas = compute_layout(ratatui::layout::Rect::new(0, 0, 80, 20), 3);
         let (up, down) = palette_scroll_hint(&areas, &app);
         assert!(!up && down);
         let gx = areas.palette_grid.x;
@@ -1418,12 +1613,30 @@ mod tests {
         app.scroll_palette(10_000, cols, areas.palette_grid.height as usize);
         let (up2, down2) = palette_scroll_hint(&areas, &app);
         assert!(up2 && !down2);
-        let buf2 = render_to_buf(&mut app, &t);
+        let buf2 = render_to_buf_sized(&mut app, &t, 80, 20);
         assert_eq!(buf2[(arrow_x, areas.palette_grid.y)].symbol(), "▲");
         assert_eq!(
             hit_palette_scroll(&areas, &app, arrow_x, areas.palette_grid.y),
             Some(-1)
         );
+    }
+
+    #[test]
+    fn colors_scrollbar_geometry() {
+        // Fits: no bar. Too short for arrows + track: no bar.
+        assert_eq!(scrollbar_geom(5, 0, 9), None);
+        assert_eq!(scrollbar_geom(40, 0, 2), None);
+        // 40 rows, 9 visible: track 7, thumb 1, starts at top.
+        assert_eq!(scrollbar_geom(40, 0, 9), Some((0, 1)));
+        // Bottom: thumb pinned to the track end.
+        assert_eq!(scrollbar_geom(40, 31, 9), Some((6, 1)));
+        // Middle scales proportionally: 15*6/31 = 2.
+        assert_eq!(scrollbar_geom(40, 15, 9), Some((2, 1)));
+        // Single-row track edge: thumb fills it.
+        assert_eq!(scrollbar_geom(40, 7, 3), Some((0, 1)));
+        // Jump targets hit both ends exactly.
+        assert_eq!(colors_bar_target(40, 9, 0), 0);
+        assert_eq!(colors_bar_target(40, 9, 6), 31);
     }
 
     #[test]
@@ -1539,7 +1752,7 @@ mod tests {
         app.colors_scroll = transp;
         let screen = screen_text(&render_to_buf(&mut app, &t));
         assert!(screen.contains("-none-"), "missing -none-:\n{screen}");
-        // Entry row: fg pot marker `>` plus a 9-block swatch.
+        // Entry row: fg pot marker `▶` plus a 9-block swatch.
         let (entry_idx, entry_color) = rows
             .iter()
             .enumerate()
@@ -1560,7 +1773,7 @@ mod tests {
             Some(entry_idx)
         );
         let buf = render_to_buf(&mut app, &t);
-        assert_eq!(buf[(areas.colors.x, areas.colors.y)].symbol(), ">");
+        assert_eq!(buf[(areas.colors.x, areas.colors.y)].symbol(), "▶");
         let row_text: String = (0..areas.colors.width)
             .map(|x| buf[(areas.colors.x + x, areas.colors.y)].symbol().to_string())
             .collect();
@@ -1568,27 +1781,53 @@ mod tests {
             row_text.contains("█████████"),
             "missing swatch in {row_text:?}"
         );
-        // Both pots on the entry → `#`; bg pot only → `*`.
+        // Both pots on the entry → `◉`; bg pot only → `●`.
         app.bg = Some(entry_color);
         let buf = render_to_buf(&mut app, &t);
-        assert_eq!(buf[(areas.colors.x, areas.colors.y)].symbol(), "#");
+        assert_eq!(buf[(areas.colors.x, areas.colors.y)].symbol(), "◉");
         app.fg = PaintColor::Ansi(0);
         if entry_color != PaintColor::Ansi(0) {
             let buf = render_to_buf(&mut app, &t);
-            assert_eq!(buf[(areas.colors.x, areas.colors.y)].symbol(), "*");
+            assert_eq!(buf[(areas.colors.x, areas.colors.y)].symbol(), "●");
         }
     }
 
     #[test]
-    fn tools_rail_uses_pointer_marker() {
+    fn tools_rail_btop_hotkeys_and_pencil_icon() {
         let (mut app, t) = harness();
-        let screen = screen_text(&render_to_buf(&mut app, &t));
-        // Active tool (pencil) carries `►`; tabs keep `>`.
-        assert!(screen.contains("►p pencil"), "missing ► marker:\n{screen}");
+        let (accent, bg) = (t.accent, t.bg);
+        let buf = render_to_buf(&mut app, &t);
+        let areas = compute_layout(ratatui::layout::Rect::new(0, 0, 80, 24), 3);
+        // Pencil row: nerd pencil icon + `P` hotkey underlined. The active
+        // row inverts the hotkey (bg-colored on the accent row) so it stays
+        // legible — contrast either way.
+        let pencil = &buf[(areas.tools.x + 2, areas.tools.y)];
+        assert_eq!(pencil.symbol(), "P", "hotkey letter: {pencil:?}");
+        assert!(
+            pencil.modifier.contains(Modifier::UNDERLINED),
+            "hotkey underlined: {pencil:?}"
+        );
+        assert_eq!(pencil.fg, bg, "active-row hotkey contrast: {pencil:?}");
+        assert_eq!(buf[(areas.tools.x, areas.tools.y)].symbol(), "\u{F040}");
+        let screen = screen_text(&buf);
+        assert!(screen.contains("Pencil"), "label:\n{screen}");
         assert!(screen.contains("> Outline"), "tabs keep >:\n{screen}");
+        // Inactive rows use the accent hotkey.
+        app.set_tool(Tool::Pan);
+        let buf = render_to_buf(&mut app, &t);
+        let pencil = &buf[(areas.tools.x + 2, areas.tools.y)];
+        assert_eq!(pencil.fg, accent, "inactive-row hotkey: {pencil:?}");
+        assert_eq!(buf[(areas.tools.x, areas.tools.y)].symbol(), "\u{F040}");
+        let screen = screen_text(&buf);
+        assert!(screen.contains("Pencil"), "label:\n{screen}");
+        assert!(screen.contains("> Outline"), "tabs keep >:\n{screen}");
+        // Tools without an in-label hotkey get a dim suffix instead.
+        app.set_tool(Tool::Rect);
+        let screen = screen_text(&render_to_buf(&mut app, &t));
+        assert!(screen.contains("rect (d)"), "rect suffix:\n{screen}");
         app.set_tool(Tool::Pan);
         let screen = screen_text(&render_to_buf(&mut app, &t));
-        assert!(screen.contains("►_ pan"), "moved ► marker:\n{screen}");
+        assert!(screen.contains("pan (space)"), "pan suffix:\n{screen}");
     }
 
     #[test]

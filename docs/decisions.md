@@ -35,7 +35,32 @@ from `docs/tools-spec.md` and `skills/omaframe/` so Wave 2 agents are unblocked.
   SKILL.md §2 wording; demo unaffected). SKILL.md to be amended in Wave 2
   if the skill agent's text and model diverge anywhere else.
 
-## Wave 6: truecolor, grouped Colors, file dialog, extended chars
+## Wave 7: voice round (RGB truth, live themes, gaps, nerd chrome)
+
+User corrections: their theme is NOT picotron (never assume); ANSI-safe
+clamping is a non-goal — RGB accuracy is; theme colors must be live.
+
+- **Fallback honesty**: `defaults()` relabeled (values were always
+  Catppuccin-Mocha-ish, never picotron). Live systems override via load.
+- **Live theme reload**: `ThemeWatch` (path + mtime latch, testable core)
+  + 250ms event poll in main loop. Chrome, ANSI slots, and panel swatches
+  re-tint on `omarchy theme set`; frozen RGB cells untouched; status shows
+  `theme: {name}`.
+- **Gaps**: 1-cell spacers between panel columns (clicks fall through);
+  full-frame `Clear` first so gaps never smear on resize.
+- **Status bar deleted**: cursor cell → canvas top border right
+  (`┌─┐0,0┌──12,34┌─┐`); size + last message → bottom border
+  (`└─┘Size:WxH · msg└──┘`, word-boundary truncation). Dead helpers
+  (`file_label`, `active_layer_name`) removed.
+- **Colors scrollbar**: ▲▼ ends + ░ track + █ thumb (pure geom fn,
+  proportional jump on track click, arrows ±1, thumb clicks ignored).
+- **Nerd chrome**: tool rows `{icon} {Label}` with btop hotkey letter
+  (accent + underline, contrast-inverted on the active row); pencil gets
+  U+F040 (verified in nerd.txt); Rect/Pan fall back to dim `(d)`/`(space)`
+  suffixes. Colors markers ▶/●/◉; layers ▶ active + ●/○ visibility.
+  `LEFT_W` 14→15 to fit `pan (space)`.
+- QA: 75 tests, clippy clean, golden intact, headless dumps match the
+  wireframe, menu build reinstalled.
 
 - **PaintColor**: cells are `fg: PaintColor` (`Ansi(u8)` live theme slot |
   `Rgb` frozen) + `bg: Option<PaintColor>` (`None` = transparent). Files

@@ -640,21 +640,6 @@ impl App {
         format!("{base}{}", if self.dirty { "*" } else { "" })
     }
 
-    pub fn file_label(&self) -> String {
-        match &self.file_path {
-            Some(p) => format!(
-                "{}{}",
-                p.file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("untitled"),
-                if self.dirty { "*" } else { "" }
-            ),
-            None => format!("untitled{}", if self.dirty { "*" } else { "" }),
-        }
-    }
-
-    /// Foreground pot label for the status bar (`Ansi` → slot index,
-    /// `Rgb` → `#rrggbb`).
     pub fn fg_label(&self) -> String {
         match self.fg {
             PaintColor::Ansi(i) => i.to_string(),
@@ -1619,14 +1604,6 @@ impl App {
             self.fg_label(),
             PALETTE_TABS[self.palette_tab]
         ));
-    }
-
-    pub fn active_layer_name(&self) -> &str {
-        self.doc
-            .layers
-            .get(self.doc.active)
-            .map(|l| l.name.as_str())
-            .unwrap_or("-")
     }
 
     pub fn is_text_session(&self) -> bool {

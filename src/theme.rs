@@ -55,12 +55,10 @@ pub struct Theme {
     pub snapshots: HashMap<String, PaintColor>,
 }
 
-/// Built-in picotron-dark defaults (plan §2.4).
-///
-/// Roles come straight from the plan: bg `#1e1e2e`, fg `#cdd6f4`,
-/// accent `#89b4fa`, selection `#45475a`, muted `#585b70`.
-/// The plan lists no `color0–15`, so `ansi` falls back to a sane
-/// Catppuccin-Mocha-flavoured 16-slot ramp (distinct, dark-bg legible).
+/// Built-in dark fallback (used when no Omarchy theme file is found, e.g.
+/// non-Omarchy machines and tests). Legible dark-background values in the
+/// Catppuccin Mocha family — deliberately generic, NOT any specific
+/// Omarchy theme. Live systems always override these via [`load`].
 pub fn defaults() -> Theme {
     Theme {
         bg: Color::Rgb(0x1e, 0x1e, 0x2e),
@@ -409,6 +407,70 @@ pub fn load() -> Theme {
     theme
 }
 
+// ---------------------------------------------------------------------------
+// Live theme reload (theme watcher)
+// ---------------------------------------------------------------------------
+
+/// Tracks the active theme file across event-loop iterations: when the
+/// resolved path or its mtime changes (user ran `omarchy theme set`, or
+/// edited the file), the app reloads so chrome, ANSI slots, and panel
+/// swatches follow the new theme without a restart. Frozen RGB cells are
+/// untouched by design.
+pub struct ThemeWatch {
+    path: Option<PathBuf>,
+    mtime: Option<std::time::SystemTime>,
+}
+
+impl ThemeWatch {
+    /// Seed from the current state (no spurious reload on first check).
+    pub fn new() -> Self {
+        let mut w = ThemeWatch {
+            path: None,
+            mtime: None,
+        };
+        let _ = w.check();
+        w
+    }
+
+    /// Poll the filesystem. Returns the new theme path when it changed
+    /// since the last check (caller reloads via [`load`]).
+    pub fn check(&mut self) -> Option<PathBuf> {
+        Self::check_path(self, resolved_path())
+    }
+
+    /// Testable core: compare + latch a candidate path.
+    pub fn check_path(&mut self, path: Option<PathBuf>) -> Option<PathBuf> {
+        let mtime = path
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .and_then(|m| m.modified().ok());
+        if path != self.path || mtime != self.mtime {
+            self.path = path.clone();
+            self.mtime = mtime;
+            path
+        } else {
+            None
+        }
+    }
+}
+
+impl Default for ThemeWatch {
+    fn default() -> Self {
+        ThemeWatch::new()
+    }
+}
+
+/// Human theme name for status messages: the theme directory name
+/// (`…/themes/gruvbox/colors.toml` → `gruvbox`), else `"custom"`.
+pub fn theme_name(path: &std::path::Path) -> String {
+    path.parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+        .unwrap_or("custom")
+        .to_string()
+}
+
 /// Ratatui style for a canvas cell.
 ///
 /// `fg` resolves against [`Theme::ansi`] via [`resolve`]; `bg == None`
@@ -709,6 +771,48 @@ mod tests {
         }
         // `load()` without a theme dir still yields the defaults (never panics).
         let _ = load();
+    }
+
+    #[test]
+    fn theme_watch_detects_change() {
+        let root = std::env::temp_dir().join("omaframe-watch-test");
+        let _ = std::fs::create_dir_all(&root);
+        let a = root.join("a.toml");
+        let b = root.join("b.toml");
+        std::fs::write(&a, "accent = \"#111111\"\n").unwrap();
+        std::fs::write(&b, "accent = \"#222222\"\n").unwrap();
+        let mut w = ThemeWatch {
+            path: None,
+            mtime: None,
+        };
+        // First sighting latches and reports.
+        assert_eq!(w.check_path(Some(a.clone())), Some(a.clone()));
+        // Same path + mtime: quiet.
+        assert_eq!(w.check_path(Some(a.clone())), None);
+        // Retarget (theme switch): reports.
+        assert_eq!(w.check_path(Some(b.clone())), Some(b.clone()));
+        // Content edit: mtime moves, reports. (Different content ensures
+        // the write lands; filesystems with coarse mtime still differ
+        // because the bytes changed... no — mtime may tie. Rewrite twice.)
+        std::fs::write(&b, "accent = \"#333333\"\n").unwrap();
+        let first = w.check_path(Some(b.clone()));
+        std::fs::write(&b, "accent = \"#444444\"\n").unwrap();
+        let second = w.check_path(Some(b.clone()));
+        assert!(
+            first.is_some() || second.is_some(),
+            "an edit must surface within two writes"
+        );
+        // Vanished file reports the change (caller keeps the old theme).
+        std::fs::remove_file(&b).unwrap();
+        assert_eq!(w.check_path(Some(b.clone())), Some(b.clone()));
+        assert_eq!(w.check_path(None), None);
+        let _ = std::fs::remove_dir_all(&root);
+        // Name helper.
+        assert_eq!(
+            theme_name(&PathBuf::from("/x/themes/gruvbox/colors.toml")),
+            "gruvbox"
+        );
+        assert_eq!(theme_name(&PathBuf::from("colors.toml")), "custom");
     }
 
     #[test]
