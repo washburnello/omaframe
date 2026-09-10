@@ -502,7 +502,7 @@ fn handle_mouse(
         MouseEventKind::Down(MouseButton::Left) => {
             if let Some(action) = ui::hit_menu(areas, col, row) {
                 match action {
-                    ui::MenuAction::New => app.open_save_new_dialog(),
+                    ui::MenuAction::New => app.new_file_request(),
                     ui::MenuAction::Save => app.menu_save(),
                     ui::MenuAction::SaveAs => app.open_save_as_dialog(),
                     ui::MenuAction::Load => app.open_load_dialog(),
@@ -792,25 +792,25 @@ mod tests {
         root
     }
 
-    /// Regression: Enter in a Save dialog must confirm (create the file).
+    /// Regression: Enter in a Save dialog must confirm (bind + save).
     /// Previously Enter only descended into highlighted folders, so
     /// keyboard users could never create a file.
     #[test]
-    fn enter_in_save_dialog_confirms_new_file() {
+    fn enter_in_save_dialog_confirms() {
         let root = isolated_root("save");
         let mut app = App::new(Document::new("t", 80, 24), None);
-        app.open_save_new_dialog();
+        app.open_save_as_dialog();
         app.file_dialog.as_mut().unwrap().goto(root.clone());
-        // Prefilled default name — no retyping, no clicks.
+        app.file_dialog.as_mut().unwrap().filename.clear();
+        for c in "n.oframe".chars() {
+            app.dialog_type(c);
+        }
         assert!(app.file_dialog.as_ref().unwrap().confirm_path().is_some());
         handle_key(&mut app, KeyCode::Enter, KeyModifiers::empty());
-        assert!(app.file_dialog.is_none(), "Enter confirms SaveNew");
+        assert!(app.file_dialog.is_none(), "Enter confirms SaveAs");
         let path = app.file_path.clone().expect("bound");
+        assert_eq!(path, root.join("n.oframe"));
         assert!(path.exists(), "file created");
-        assert_eq!(
-            path.file_name().and_then(|s| s.to_str()),
-            Some("t.oframe")
-        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -820,7 +820,7 @@ mod tests {
         let root = isolated_root("descend");
         std::fs::create_dir_all(root.join("sub")).unwrap();
         let mut app = App::new(Document::new("t", 80, 24), None);
-        app.open_save_new_dialog();
+        app.open_save_as_dialog();
         app.file_dialog.as_mut().unwrap().goto(root.clone());
         app.dialog_move_selection(1); // first row: the subdir
         assert!(dialog_selected_is_dir(&app));

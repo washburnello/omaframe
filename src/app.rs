@@ -432,12 +432,11 @@ pub enum DialogMode {
     Save,
 }
 
-/// Why the dialog was opened: loading replaces the document, SaveNew starts
-/// a fresh bound document, SaveAs re-binds the current document.
+/// Why the dialog was opened: loading replaces the document, SaveAs
+/// re-binds the current document.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DialogPurpose {
     Load,
-    SaveNew,
     SaveAs,
 }
 
@@ -793,6 +792,8 @@ pub struct App {
     pub should_quit: bool,
     pub last_dir: Option<PathBuf>,
     pending_overwrite: Option<PathBuf>,
+    /// Armed New-file discard confirm (first New press with dirty work).
+    pending_new: bool,
     anchor: Option<(i32, i32)>,
     drawing: bool,
     text_start: Option<(i32, i32)>,
@@ -841,6 +842,7 @@ impl App {
             should_quit: false,
             last_dir: Self::read_lastdir(),
             pending_overwrite: None,
+            pending_new: false,
             anchor: None,
             drawing: false,
             text_start: None,
@@ -1145,6 +1147,8 @@ impl App {
         if self.tool == Tool::Select && t != Tool::Select {
             self.history.clear_selection();
         }
+        // Phase 3 gestures + pending New confirm never survive a tool switch.
+        self.pending_new = false;
         // Phase 3 gestures never survive a tool switch.
         self.select_drag = None;
         self.sel_at_press = None;
@@ -1277,21 +1281,6 @@ impl App {
         PathBuf::from(s)
     }
 
-    fn doc_name_for(path: &std::path::Path) -> String {
-        let file_name = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-        let stripped = file_name
-            .strip_suffix(".oframe")
-            .unwrap_or(file_name);
-        if stripped.is_empty() {
-            "untitled".to_string()
-        } else {
-            stripped.to_string()
-        }
-    }
-
     /// Own config dir (`~/.config/omaframe`, `XDG_CONFIG_HOME`-aware).
     fn config_dir() -> Option<PathBuf> {
         std::env::var("XDG_CONFIG_HOME")
@@ -1359,6 +1348,7 @@ impl App {
     /// saved first when bound (or Save As opens when pathless) so nothing
     /// is silently discarded.
     pub fn open_load_dialog(&mut self) {
+        self.pending_new = false;
         if self.dirty {
             if self.file_path.is_some() {
                 if !self.save() {
@@ -1380,41 +1370,22 @@ impl App {
         self.set_status("load: pick a .oframe file");
     }
 
-    /// Open the SaveNew dialog (fresh bound file at the confirmed path).
-    /// Dirty work is saved first like [`App::open_load_dialog`].
-    pub fn open_save_new_dialog(&mut self) {
-        if self.dirty {
-            if self.file_path.is_some() {
-                if !self.save() {
-                    return;
-                }
-            } else {
-                self.open_save_as_dialog();
-                self.set_status("save first — then New");
-                return;
-            }
+    /// Menu → New: two-step when dirty (first press arms, second press
+    /// discards into a blank file), immediate blank reinit when clean.
+    pub fn new_file_request(&mut self) {
+        if self.dirty && !self.pending_new {
+            self.pending_new = true;
+            self.set_status("unsaved changes — New again to discard, Esc cancels");
+            return;
         }
-        let start = self.dialog_start_dir();
-        let mut d = FileDialog::new(DialogMode::Save, DialogPurpose::SaveNew, start);
-        d.filename = self.save_dialog_filename();
-        self.pending_overwrite = None;
-        self.file_dialog = Some(d);
-        self.set_status("new file: pick a folder + name");
+        self.pending_new = false;
+        self.new_blank();
     }
 
-    /// Open the SaveAs dialog (re-bind the current document on confirm).
-    pub fn open_save_as_dialog(&mut self) {
-        let start = self.dialog_start_dir();
-        let mut d = FileDialog::new(DialogMode::Save, DialogPurpose::SaveAs, start);
-        d.filename = self.save_dialog_filename();
-        self.file_dialog = Some(d);
-        self.set_status("save as: pick a folder + name");
-    }
-
-    /// Menu → New: keeps the file path slot (save first if dirty), starts a
-    /// fresh 80×24 canvas.
-    pub fn new_file_to(&mut self, path: PathBuf) -> bool {
-        self.doc = Document::new(Self::doc_name_for(&path), 80, 24);
+    /// Fresh blank 80×24 canvas: unbound (save later via Save/SaveAs),
+    /// clean, cursor home, no selection.
+    pub fn new_blank(&mut self) {
+        self.doc = Document::new("untitled", 80, 24);
         self.preview_dark = self.doc.preview_dark;
         self.palette_tab = palette_tab_index(&self.doc.palette_tab);
         self.history = History::new();
@@ -1422,19 +1393,24 @@ impl App {
         self.cursor = (0, 0);
         self.viewport = (0, 0);
         self.palette_scroll = 0;
-        self.file_path = Some(path.clone());
-        match omaframe::model::save_file(&self.doc, &path) {
-            Ok(()) => {
-                self.dirty = false;
-                self.set_status(format!("created {}", path.display()));
-                true
-            }
-            Err(e) => {
-                self.dirty = true;
-                self.set_status(format!("save failed: {e}"));
-                false
-            }
-        }
+        self.file_path = None;
+        self.dirty = false;
+        self.selected_widget = None;
+        self.select_drag = None;
+        self.sel_at_press = None;
+        self.anchor = None;
+        self.drawing = false;
+        self.set_status("new blank canvas");
+    }
+
+    /// Open the SaveAs dialog (re-bind the current document on confirm).
+    pub fn open_save_as_dialog(&mut self) {
+        self.pending_new = false;
+        let start = self.dialog_start_dir();
+        let mut d = FileDialog::new(DialogMode::Save, DialogPurpose::SaveAs, start);
+        d.filename = self.save_dialog_filename();
+        self.file_dialog = Some(d);
+        self.set_status("save as: pick a folder + name");
     }
 
     /// Menu → Load / dialog Load confirm: replaces the document on success,
@@ -1487,11 +1463,11 @@ impl App {
         }
     }
 
-    /// Confirm the open dialog: Load → [`App::load_file_path`], SaveNew →
-    /// [`App::new_file_to`], SaveAs → [`App::save_as_path`]. SaveNew/SaveAs
-    /// onto an existing file need two consecutive confirms (overwrite
-    /// guard); anything else that changes the target clears the pending
-    /// state. Closes the dialog on success and remembers the directory.
+    /// Confirm the open dialog: Load → [`App::load_file_path`], SaveAs →
+    /// [`App::save_as_path`]. SaveAs onto an existing file needs two
+    /// consecutive confirms (overwrite guard); anything else that changes
+    /// the target clears the pending state. Closes the dialog on success
+    /// and remembers the directory.
     pub fn dialog_confirm(&mut self) {
         let Some(dlg) = self.file_dialog.as_ref() else {
             return;
@@ -1504,10 +1480,8 @@ impl App {
             });
             return;
         };
-        if matches!(
-            purpose,
-            DialogPurpose::SaveNew | DialogPurpose::SaveAs
-        ) && path.exists()
+        if purpose == DialogPurpose::SaveAs
+            && path.exists()
             && self.pending_overwrite.as_ref() != Some(&path)
         {
             self.pending_overwrite = Some(path);
@@ -1517,7 +1491,6 @@ impl App {
         self.pending_overwrite = None;
         let ok = match purpose {
             DialogPurpose::Load => self.load_file_path(path),
-            DialogPurpose::SaveNew => self.new_file_to(path),
             DialogPurpose::SaveAs => self.save_as_path(path),
         };
         if ok {
@@ -1882,6 +1855,7 @@ impl App {
 
     /// Begin a left-drag gesture at a document cell.
     pub fn start_stroke(&mut self, x: i32, y: i32, _shift: bool) {
+        self.pending_new = false;
         let (x, y) = self.resolve_guard(x, y);
         self.cursor = (x, y);
         self.clamp_cursor();
@@ -2476,6 +2450,11 @@ impl App {
             self.set_status("widget disarmed");
             return;
         }
+        if self.pending_new {
+            self.pending_new = false;
+            self.set_status("cancelled");
+            return;
+        }
         if self.history.selection().is_some() {
             self.history.clear_selection();
             self.selected_widget = None;
@@ -3030,15 +3009,61 @@ mod tests {
     }
 
     #[test]
-    fn dialog_save_new_and_load_round_trip() {
-        let root = tempdir("dlg-rt");
-        // SaveNew flow through dialog_confirm: fresh doc bound + saved.
+    fn new_file_request_confirms_then_blanks() {
+        // Clean doc: immediate blank reinit, no dialog, no questions.
         let mut app = App::new(test_doc(), None);
-        app.open_save_new_dialog();
+        app.new_file_request();
+        assert!(!app.pending_new);
+        assert_eq!(app.file_path, None);
+        assert!(!app.dirty);
+        assert_eq!(app.doc.name, "untitled");
+        assert_eq!(app.cursor, (0, 0));
+        // Dirty doc: first press arms, keeps everything.
+        app.start_stroke(2, 2, false);
+        app.end_stroke();
+        assert!(app.dirty);
+        app.new_file_request();
+        assert!(app.pending_new, "armed");
+        assert!(app.dirty, "work kept while armed");
+        assert!(app.doc.cell(2, 2).is_some());
+        assert!(app.status_msg.contains("New again"));
+        // Drawing instead cancels the arm.
+        app.start_stroke(3, 3, false);
+        app.end_stroke();
+        assert!(!app.pending_new);
+        // Re-arm, then confirm: blank reinit, unbound, clean.
+        app.new_file_request();
+        app.new_file_request();
+        assert!(!app.pending_new);
+        assert_eq!(app.file_path, None);
+        assert!(!app.dirty);
+        assert_eq!(app.doc.cell(2, 2), None, "blanked");
+        assert_eq!(app.doc.cell(3, 3), None, "blanked");
+        assert_eq!(app.history.selection(), None);
+        // Esc cancels the arm without losing work.
+        app.start_stroke(4, 4, false);
+        app.end_stroke();
+        app.new_file_request();
+        assert!(app.pending_new);
+        app.cancel_stroke();
+        assert!(!app.pending_new);
+        assert!(app.dirty, "work kept after Esc");
+        assert!(app.doc.cell(4, 4).is_some());
+    }
+
+    #[test]
+    fn save_as_flow_and_load_round_trip() {
+        let root = tempdir("dlg-rt");
+        // SaveAs flow through dialog_confirm binds + saves.
+        let mut app = App::new(test_doc(), None);
+        app.start_stroke(2, 3, false);
+        app.update_stroke(4, 3, false);
+        app.end_stroke();
+        app.open_save_as_dialog();
         assert!(app.file_dialog.is_some());
         assert_eq!(
             app.file_dialog.as_ref().unwrap().purpose,
-            DialogPurpose::SaveNew
+            DialogPurpose::SaveAs
         );
         app.file_dialog.as_mut().unwrap().goto(root.clone());
         app.file_dialog.as_mut().unwrap().filename.clear();
@@ -3049,19 +3074,20 @@ mod tests {
         assert!(app.file_dialog.is_none(), "dialog closes on success");
         let path = root.join("rt.oframe");
         assert_eq!(app.file_path, Some(path.clone()));
-        assert!(path.exists(), "new_file_to saves immediately");
+        assert!(path.exists(), "save_as writes immediately");
 
-        // Paint + commit marks dirty WITHOUT writing (explicit save
+        // Fresh cells + commit mark dirty WITHOUT writing (explicit save
         // model), then load the file back in a fresh app via dialog.
-        app.start_stroke(2, 3, false);
-        app.update_stroke(4, 3, false);
+        // (Fresh cells: the pre-save stroke already occupies (2,3)-(4,3).)
+        app.start_stroke(5, 5, false);
+        app.update_stroke(6, 5, false);
         app.end_stroke();
         assert!(app.dirty, "stroke marks dirty");
         let on_disk = omaframe::model::load_file(&path).unwrap();
-        assert!(on_disk.cell(2, 3).is_none(), "no autosave: disk unchanged");
+        assert!(on_disk.cell(5, 5).is_none(), "no autosave: disk unchanged");
         assert!(app.save(), "explicit save writes");
         let on_disk = omaframe::model::load_file(&path).unwrap();
-        assert!(on_disk.cell(2, 3).is_some(), "saved stroke on disk");
+        assert!(on_disk.cell(5, 5).is_some(), "saved stroke on disk");
 
         let mut app2 = App::new(test_doc(), None);
         app2.open_load_dialog();
@@ -3078,13 +3104,14 @@ mod tests {
         app2.dialog_enter(); // file in Open mode confirms immediately
         assert!(app2.file_dialog.is_none());
         assert_eq!(app2.file_path, Some(path.clone()));
-        assert!(app2.doc.cell(2, 3).is_some(), "loaded painted cell");
+        assert!(app2.doc.cell(2, 3).is_some(), "loaded pre-save cell");
+        assert!(app2.doc.cell(5, 5).is_some(), "loaded post-save cell");
 
         // Failure keeps the dialog open: blank SaveAs name confirms nothing.
         app2.menu_save(); // path bound → plain save, no dialog
         assert!(app2.file_dialog.is_none());
         let mut app3 = App::new(test_doc(), None);
-        app3.open_save_new_dialog();
+        app3.open_save_as_dialog();
         app3.file_dialog.as_mut().unwrap().goto(root.clone());
         app3.file_dialog.as_mut().unwrap().filename.clear();
         app3.dialog_confirm();
@@ -3099,7 +3126,7 @@ mod tests {
     }
 
     #[test]
-    fn save_appends_oframe_and_strips_suffix_for_doc_names() {
+    fn save_appends_oframe() {
         use omaframe::model::FILE_EXTENSION;
         assert_eq!(FILE_EXTENSION, "oframe");
         // Bare names gain the extension; correct/other extensions pass.
@@ -3115,19 +3142,6 @@ mod tests {
         assert_eq!(d.confirm_path(), Some(root.join("foo.oframe")));
         d.filename = "foo.txt".to_string();
         assert_eq!(d.confirm_path(), Some(root.join("foo.oframe")));
-        // Doc names strip the full suffix (no double-extension bug).
-        assert_eq!(
-            App::doc_name_for(&root.join("foo.oframe")),
-            "foo"
-        );
-        assert_eq!(
-            App::doc_name_for(&root.join("plain")),
-            "plain"
-        );
-        assert_eq!(
-            App::doc_name_for(&root.join(".oframe")),
-            "untitled"
-        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3237,17 +3251,15 @@ mod tests {
     #[test]
     fn menu_file_ops_and_color_pots() {
         let mut app = App::new(test_doc(), None);
-        // New-file flow binds the path and saves immediately (macOS-style).
-        let dir = std::env::temp_dir().join("omaframe-newfile-test");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("n.oframe");
-        let _ = std::fs::remove_file(&path);
-        app.dirty = true;
-        assert!(app.new_file_to(path.clone()));
+        // New-file flow reinits blank + unbound (save later via Save As).
+        app.start_stroke(1, 1, false);
+        app.end_stroke();
+        app.new_file_request();
+        app.new_file_request();
         assert!(!app.dirty);
         assert_eq!(app.history.undo_len(), 0);
-        assert!(path.exists(), "created up front");
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(app.file_path, None);
+        assert_eq!(app.doc.name, "untitled");
         // Truecolor pots accept any PaintColor verbatim.
         app.set_fg(PaintColor::Ansi(3));
         assert_eq!(app.fg, PaintColor::Ansi(3));
@@ -3258,9 +3270,9 @@ mod tests {
         assert_eq!(app.bg_label(), "-");
         app.set_bg(Some(PaintColor::Ansi(5)));
         assert_eq!(app.bg, Some(PaintColor::Ansi(5)));
-        // Pan tool shortcut + full path label.
+        // Pan tool shortcut + unbound new-file label.
         assert_eq!(Tool::from_shortcut('_'), Some(Tool::Pan));
-        assert!(app.full_path_label().ends_with("n.oframe"));
+        assert_eq!(app.full_path_label(), "untitled");
         // Colors scroll clamps against the caller-provided total.
         // (17 color rows: transparent + 16 slots, headers add more.)
         app.scroll_colors(99, 17, 5);
